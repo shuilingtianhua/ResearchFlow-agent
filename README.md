@@ -8,6 +8,8 @@ ResearchFlow Agent 是一个基于 Sea-mult-agent 业务基线、使用 Python �
 
 - [产品需求文档](docs/PRD.md)
 - [Python 架构设计](docs/ARCHITECTURE.md)
+- [开发记录规范与索引](docs/development/README.md)
+- [M1 执行闭环实施记录](docs/development/2026-08-14_m1_execution_loop.md)
 
 ## 本地启动
 
