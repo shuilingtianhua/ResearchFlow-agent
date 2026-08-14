@@ -6,8 +6,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
+from anyio import create_task_group
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from researchflow.api.schemas import EventResponse, RunActionRequest, RunResponse, StartRunRequest
 from researchflow.domain.errors import ConflictError, ContractViolation, NotFoundError
@@ -21,7 +22,10 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await runtime.recover_interrupted_runs()
-        yield
+        async with create_task_group() as task_group:
+            task_group.start_soon(runtime.run_worker)
+            yield
+            task_group.cancel_scope.cancel()
 
     app = FastAPI(title=resolved.app_name, version="0.0.0", lifespan=lifespan)
     app.state.runtime = runtime
@@ -48,7 +52,7 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
 
     @app.post("/runs", response_model=RunResponse, status_code=status.HTTP_201_CREATED)
     async def start_run(request: StartRunRequest) -> RunResponse:
-        result = await runtime.dispatch(
+        result = await runtime.submit(
             StartRun(
                 run_id=request.run_id or str(uuid4()),
                 goal=request.goal,
@@ -69,6 +73,25 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
         ]
         return events
 
+    @app.get("/runs/{run_id}/events/stream")
+    async def stream_events(run_id: str, after_sequence: int = 0) -> StreamingResponse:
+        await runtime.get(run_id)
+
+        async def encode_events() -> AsyncIterator[str]:
+            async for event in runtime.watch_events(run_id, after_sequence):
+                response = EventResponse.from_event(event)
+                yield (
+                    f"id: {response.sequence}\n"
+                    f"event: {response.kind}\n"
+                    f"data: {response.model_dump_json()}\n\n"
+                )
+
+        return StreamingResponse(
+            encode_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.post("/runs/{run_id}/pause", response_model=RunResponse)
     async def pause_run(run_id: str, request: RunActionRequest) -> RunResponse:
         result = await runtime.dispatch(PauseRun(run_id=run_id, reason=request.reason))
@@ -76,7 +99,7 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
 
     @app.post("/runs/{run_id}/resume", response_model=RunResponse)
     async def resume_run(run_id: str) -> RunResponse:
-        result = await runtime.dispatch(ResumeRun(run_id=run_id))
+        result = await runtime.submit(ResumeRun(run_id=run_id))
         return RunResponse.from_snapshot(result.snapshot)
 
     @app.post("/runs/{run_id}/cancel", response_model=RunResponse)

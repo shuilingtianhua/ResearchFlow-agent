@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import NoReturn
 from uuid import uuid4
 
-from anyio import fail_after
+from anyio import create_task_group, fail_after, sleep
 
 from researchflow.capabilities import CapabilityRegistry, CapabilityRequest, CapabilityResult
 from researchflow.domain.errors import ConflictError, ContractViolation
@@ -20,6 +20,9 @@ from researchflow.runtime.contracts import CommandResult
 from researchflow.runtime.store import RunStore
 
 _COMMIT_ATTEMPTS = 5
+_EVENT_POLL_SECONDS = 0.05
+_WORKER_POLL_SECONDS = 0.05
+_TERMINAL_RUN_STATUSES = frozenset({RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED})
 
 
 class RuntimeService:
@@ -44,12 +47,57 @@ class RuntimeService:
             return await self._cancel(command)
         return self._unsupported_command(command)
 
+    async def submit(self, command: RunCommand) -> CommandResult:
+        if isinstance(command, StartRun):
+            snapshot = await self._prepare_start(command)
+            events = await self._store.list_events(snapshot.run_id)
+            return CommandResult(snapshot, events)
+        if isinstance(command, ResumeRun):
+            snapshot, after_sequence = await self._prepare_resume(command)
+            events = await self._store.list_events(snapshot.run_id, after_sequence)
+            return CommandResult(snapshot, events)
+        return await self.dispatch(command)
+
+    async def run_worker(self) -> None:
+        active_run_ids: set[str] = set()
+        async with create_task_group() as task_group:
+            while True:
+                snapshots = await self._store.list_by_status(frozenset({RunStatus.RUNNING}))
+                for snapshot in snapshots:
+                    if snapshot.run_id in active_run_ids or self._has_in_flight_task(snapshot):
+                        continue
+                    active_run_ids.add(snapshot.run_id)
+                    task_group.start_soon(
+                        self._execute_background_run,
+                        snapshot.run_id,
+                        active_run_ids,
+                    )
+                await sleep(_WORKER_POLL_SECONDS)
+
+    async def _execute_background_run(self, run_id: str, active_run_ids: set[str]) -> None:
+        try:
+            await self._execute_until_stopped(run_id)
+        finally:
+            active_run_ids.discard(run_id)
+
     async def get(self, run_id: str) -> RunSnapshot:
         return await self._store.load(run_id)
 
     async def events(self, run_id: str, after_sequence: int = 0) -> AsyncIterator[RunEvent]:
         for event in await self._store.list_events(run_id, after_sequence):
             yield event
+
+    async def watch_events(self, run_id: str, after_sequence: int = 0) -> AsyncIterator[RunEvent]:
+        await self._store.load(run_id)
+        next_sequence = after_sequence
+        while True:
+            for event in await self._store.list_events(run_id, next_sequence):
+                next_sequence = event.sequence
+                yield event
+            snapshot = await self._store.load(run_id)
+            if snapshot.status in _TERMINAL_RUN_STATUSES:
+                return
+            await sleep(_EVENT_POLL_SECONDS)
 
     async def recover_interrupted_runs(self) -> int:
         snapshots = await self._store.list_by_status(frozenset({RunStatus.RUNNING}))
@@ -83,6 +131,15 @@ class RuntimeService:
         raise ConflictError(f"recovery for {run_id!r} kept conflicting")
 
     async def _start(self, command: StartRun) -> CommandResult:
+        running = await self._prepare_start(command)
+        if running.status == RunStatus.FAILED:
+            events = await self._store.list_events(running.run_id)
+            return CommandResult(snapshot=running, emitted_events=events)
+        final = await self._execute_until_stopped(running.run_id)
+        events = await self._store.list_events(running.run_id)
+        return CommandResult(snapshot=final, emitted_events=events)
+
+    async def _prepare_start(self, command: StartRun) -> RunSnapshot:
         created = RunSnapshot(run_id=command.run_id, goal=command.goal, budget=command.budget)
         await self._store.create(
             created,
@@ -90,16 +147,12 @@ class RuntimeService:
         )
         planned = await self._plan(created, command)
         if planned.status == RunStatus.FAILED:
-            events = await self._store.list_events(planned.run_id)
-            return CommandResult(snapshot=planned, emitted_events=events)
-        running = await self._change_run_status(
+            return planned
+        return await self._change_run_status(
             planned,
             RunStatus.RUNNING,
             RunEventKind.RUN_STARTED,
         )
-        final = await self._execute_until_stopped(running.run_id)
-        events = await self._store.list_events(running.run_id)
-        return CommandResult(snapshot=final, emitted_events=events)
 
     async def _plan(self, snapshot: RunSnapshot, command: StartRun) -> RunSnapshot:
         try:
@@ -176,6 +229,12 @@ class RuntimeService:
         return paused, event
 
     async def _resume(self, command: ResumeRun) -> CommandResult:
+        running, after_sequence = await self._prepare_resume(command)
+        final = await self._execute_until_stopped(running.run_id)
+        events = await self._store.list_events(running.run_id, after_sequence)
+        return CommandResult(final, events)
+
+    async def _prepare_resume(self, command: ResumeRun) -> tuple[RunSnapshot, int]:
         for _ in range(_COMMIT_ATTEMPTS):
             snapshot = await self._store.load(command.run_id)
             if snapshot.status != RunStatus.PAUSED:
@@ -190,9 +249,7 @@ class RuntimeService:
                 )
             except ConflictError:
                 continue
-            final = await self._execute_until_stopped(running.run_id)
-            events = await self._store.list_events(running.run_id, after_sequence)
-            return CommandResult(final, events)
+            return running, after_sequence
         raise ConflictError(f"resume command for {command.run_id!r} kept conflicting")
 
     async def _cancel(self, command: CancelRun) -> CommandResult:
@@ -229,6 +286,8 @@ class RuntimeService:
         while True:
             snapshot = await self._store.load(run_id)
             if snapshot.status != RunStatus.RUNNING:
+                return snapshot
+            if self._has_in_flight_task(snapshot):
                 return snapshot
             if self._all_tasks_succeeded(snapshot):
                 try:
@@ -284,7 +343,11 @@ class RuntimeService:
             run_id=snapshot.run_id,
             task_id=task.task_id,
             execution_id=execution_id,
-            payload={"attempt": attempt, "capability": task.capability},
+            payload={
+                "attempt": attempt,
+                "capability": task.capability,
+                "lease_epoch": attempt,
+            },
         )
         try:
             running = await self._commit(snapshot, running, (event,))
@@ -352,6 +415,7 @@ class RuntimeService:
             run_id=snapshot.run_id,
             task_id=task.task_id,
             execution_id=execution_id,
+            lease_epoch=snapshot.task_attempts[task.task_id],
             inputs=inputs,
         )
 
@@ -600,6 +664,9 @@ class RuntimeService:
         return bool(snapshot.task_statuses) and all(
             status == TaskStatus.SUCCEEDED for status in snapshot.task_statuses.values()
         )
+
+    def _has_in_flight_task(self, snapshot: RunSnapshot) -> bool:
+        return any(status == TaskStatus.RUNNING for status in snapshot.task_statuses.values())
 
     def _unsupported_command(self, command: object) -> NoReturn:
         raise ContractViolation(f"unsupported command: {type(command).__name__}")

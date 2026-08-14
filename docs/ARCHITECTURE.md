@@ -62,14 +62,17 @@ flowchart LR
 
 ### 5.1 Research Runtime
 
-运行时面向业务调用暴露提交命令、读取快照和订阅事件；另提供一个由进程生命周期调用的中断恢复入口。
+运行时面向业务调用同时保留同步命令和非阻塞提交语义，进程生命周期负责启动 Worker 与中断恢复；历史事件和实时订阅共享持久化事件事实来源。
 
 ```python
 class ResearchRuntime(Protocol):
     async def recover_interrupted_runs(self) -> int: ...
+    async def run_worker(self) -> None: ...
+    async def submit(self, command: RunCommand) -> CommandResult: ...
     async def dispatch(self, command: RunCommand) -> CommandResult: ...
     async def get(self, run_id: str) -> RunSnapshot: ...
     def events(self, run_id: str, after_sequence: int = 0) -> AsyncIterator[RunEvent]: ...
+    def watch_events(self, run_id: str, after_sequence: int = 0) -> AsyncIterator[RunEvent]: ...
 ```
 
 调度器内部可演进，但不得绕过以下约束：
@@ -80,6 +83,8 @@ class ResearchRuntime(Protocol):
 4. 暂停、取消和预算耗尽必须通过显式状态迁移传播，不能只停止 HTTP 请求。
 5. 重试必须遵守任务策略和总预算。
 6. 进程启动恢复只能把中断执行转换为安全状态，不能复用旧执行身份或在 API/存储适配器中实现状态规则。
+7. Worker 领取以原子 Task 开始提交为准；只有持有当前 `execution_id` 和 `lease_epoch` 的执行结果可改变状态。
+8. SSE 只推送已经提交的事件，并通过单调序号支持重连续读。
 
 ### 5.2 Planning
 
@@ -121,7 +126,8 @@ load(version=N)
 ## 7. 并发与取消
 
 - 使用 AnyIO TaskGroup/CancelScope 进行结构化并发；禁止裸线程修改共享 Agent 状态。
-- 每个任务有独立超时、执行 ID 和租约周期。
+- 每个任务有独立超时、执行 ID 和单调租约 epoch；当前单进程 Worker 不声明远程心跳续租能力。
+- Worker 可以并发处理不同 Run；同一 Run 内无依赖冲突 Task 的并行调度仍待实现。
 - 并发度、模型 token、墙钟时间和试验次数都由 `RunBudget` 控制。
 - API 断开不取消 Run；显式取消命令或策略才会终止执行。
 - 阻塞的 Git、Docker 和文件操作放入受控线程池，不污染事件循环。
@@ -166,7 +172,7 @@ ResearchFlow-Agent/
 
 ## 10. 实施顺序
 
-1. **运行闭环**：提交目标、生成固定计划、执行 Fake Capability、持久化状态；当前已完成，SSE 仍待实现。
+1. **运行闭环**：提交目标、生成固定计划、后台执行 Fake Capability、持久化状态、重启恢复和 SSE；当前已完成，Run 内并行调度仍待实现。
 2. **真实执行**：Docker Sandbox、Git 仓库、产物存储、租约与恢复。
 3. **科研能力**：Librarian、Coder、Data 与证据化报告。
 4. **配置型 AutoResearch**：有限搜索空间、TrialLedger、Search/Holdout。

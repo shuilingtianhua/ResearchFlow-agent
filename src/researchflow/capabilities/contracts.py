@@ -15,6 +15,7 @@ class CapabilityRequest:
     run_id: str
     task_id: str
     execution_id: str
+    lease_epoch: int
     inputs: Mapping[str, object] = field(default_factory=dict)
     artifacts: tuple[ArtifactRef, ...] = ()
 

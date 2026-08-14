@@ -18,18 +18,18 @@ ResearchFlow Agent 是基于 Sea-mult-agent 业务语义、使用 Python 重构�
 
 ## 2. 当前阶段
 
-当前已经完成 M1 可运行闭环、M2.1 SQLite 持久化和 M2.2 进程重启安全恢复：
+当前已经完成 M1 可运行闭环、M2.1 SQLite 持久化、M2.2 进程重启安全恢复和 M2.3 后台执行与 SSE：
 
 ```text
-研究目标 -> 固定 DAG -> Fake Capability -> 状态迁移 -> SQLite 快照与事件 -> 启动恢复 -> HTTP 查询/Resume
+研究目标 -> 固定 DAG -> 非阻塞提交 -> 后台 Worker -> Fake Capability -> SQLite 快照与事件 -> 启动恢复/SSE
 ```
 
 当前限制：
 
-- 启动恢复会把中断的 `RUNNING` Run 原子转换为 `PAUSED`，但尚无后台 Worker 自动领取或继续执行。
+- HTTP 创建和 Resume 已使用后台 Worker；Task 以新 `execution_id` 和单调 `lease_epoch` 原子领取。
 - Planner 和 Capability 是确定性测试实现，尚未连接真实模型。
-- 事件接口返回历史 JSON，尚未实现 SSE 实时推送。
-- 后台 Worker、租约、Docker Sandbox、Git Workspace、PostgreSQL 和真实 Artifact Store 尚未接入。
+- 历史 JSON 和 SSE 使用同一持久化事件流，支持按事件序号断点续读。
+- 同一 Run 内的独立 Task 仍按顺序执行；跨节点心跳租约、Docker Sandbox、Git Workspace、PostgreSQL 和真实 Artifact Store 尚未接入。
 
 新增功能应按可运行的垂直切片推进，不要先批量创建没有行为的空目录或抽象层。
 
