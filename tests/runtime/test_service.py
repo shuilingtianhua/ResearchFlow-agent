@@ -39,6 +39,11 @@ class SingleTaskPlanner:
         )
 
 
+class FailingPlanner:
+    async def build(self, context: PlanningContext) -> PlanDefinition:
+        raise RuntimeError("planner unavailable")
+
+
 class BlockingCapability:
     def __init__(self, name: str) -> None:
         self._name = name
@@ -148,6 +153,34 @@ def test_runtime_executes_dependencies_in_order() -> None:
         assert [event.sequence for event in result.emitted_events] == list(
             range(1, len(result.emitted_events) + 1)
         )
+
+    asyncio.run(scenario())
+
+
+def test_runtime_records_planning_failure() -> None:
+    async def scenario() -> None:
+        capability = FakeCapability("unused")
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=FailingPlanner(),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+
+        result = await runtime.dispatch(StartRun(run_id="run-planning-failure", goal="Research"))
+
+        assert result.snapshot.status == RunStatus.FAILED
+        assert result.snapshot.plan is None
+        assert capability.invocations == []
+        assert [event.kind for event in result.emitted_events] == [
+            RunEventKind.RUN_CREATED,
+            RunEventKind.RUN_FAILED,
+        ]
+        assert result.emitted_events[-1].payload == {
+            "reason": "planning_failed",
+            "error_type": "RuntimeError",
+            "message": "planner unavailable",
+        }
+        assert await runtime.get(result.snapshot.run_id) == result.snapshot
 
     asyncio.run(scenario())
 

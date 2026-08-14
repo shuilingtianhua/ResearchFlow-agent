@@ -58,6 +58,9 @@ class RuntimeService:
             (EventDraft(kind=RunEventKind.RUN_CREATED, run_id=command.run_id),),
         )
         planned = await self._plan(created, command)
+        if planned.status == RunStatus.FAILED:
+            events = await self._store.list_events(planned.run_id)
+            return CommandResult(snapshot=planned, emitted_events=events)
         running = await self._change_run_status(
             planned,
             RunStatus.RUNNING,
@@ -68,15 +71,19 @@ class RuntimeService:
         return CommandResult(snapshot=final, emitted_events=events)
 
     async def _plan(self, snapshot: RunSnapshot, command: StartRun) -> RunSnapshot:
-        plan = await self._planner.build(
-            PlanningContext(
-                run_id=snapshot.run_id,
-                goal=snapshot.goal,
-                available_capabilities=self._capabilities.names,
-                inputs=command.inputs,
-                budget=snapshot.budget,
+        try:
+            plan = await self._planner.build(
+                PlanningContext(
+                    run_id=snapshot.run_id,
+                    goal=snapshot.goal,
+                    available_capabilities=self._capabilities.names,
+                    inputs=command.inputs,
+                    budget=snapshot.budget,
+                )
             )
-        )
+        except Exception as error:  # noqa: BLE001 - planner is an untrusted plugin boundary
+            return await self._fail_planning(snapshot, error)
+
         statuses = {task.task_id: TaskStatus.PENDING for task in plan.tasks}
         planned = replace(snapshot, status=RunStatus.PLANNED, plan=plan, task_statuses=statuses)
         event = EventDraft(
@@ -85,6 +92,19 @@ class RuntimeService:
             payload={"plan_id": plan.plan_id, "task_count": len(plan.tasks)},
         )
         return await self._commit(snapshot, planned, (event,))
+
+    async def _fail_planning(self, snapshot: RunSnapshot, error: Exception) -> RunSnapshot:
+        failed = replace(snapshot, status=RunStatus.FAILED)
+        event = EventDraft(
+            kind=RunEventKind.RUN_FAILED,
+            run_id=snapshot.run_id,
+            payload={
+                "reason": "planning_failed",
+                "error_type": type(error).__name__,
+                "message": str(error),
+            },
+        )
+        return await self._commit(snapshot, failed, (event,))
 
     async def _pause(self, command: PauseRun) -> CommandResult:
         for _ in range(_COMMIT_ATTEMPTS):

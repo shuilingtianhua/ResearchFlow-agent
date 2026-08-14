@@ -79,12 +79,21 @@ AnyIO 超时只转换自身的 `TimeoutError`；外层仍不捕获 `BaseExceptio
 结果提交和暂停、恢复、取消命令最多重新判断 5 次；执行循环中的 Ready、Started、Complete
 提交如果与控制命令冲突，也会重新加载最新状态，而不是基于旧快照继续运行。
 
+### 6.1 规划器失败语义补强
+
+合并前第二轮规范审查发现：Run 创建成功后，如果规划器抛出异常，原实现会让异常直接外泄，并让持久化快照永久停留在
+`CREATED`。这会造成调用方看到失败、状态查询却仍显示未开始，而且事件流中缺少可审计的失败原因。
+
+本次将规划器边界内的普通异常转换为原子状态提交：Run 进入 `FAILED`，同时写入 `run.failed`，事件载荷包含
+`planning_failed` 原因、异常类型和消息。调用方取消仍按异步取消机制向上传播，不会被误记为规划失败。新增失败规划器测试，
+验证最终状态、事件顺序、失败载荷、持久化快照一致性，以及 Capability 未被调用。
+
 ## 7. 验证与证据
 
 | 检查 | 实际命令 | 结果 | 证据 |
 | --- | --- | --- | --- |
-| 运行时定向测试 | `python -m pytest -q tests/runtime/test_service.py -W error::DeprecationWarning` | 12 项通过 | [`test_service.py`](../../tests/runtime/test_service.py) |
-| 全量回归 | `python -m pytest -q -W error::DeprecationWarning` | 31 项通过 | [`tests/`](../../tests) |
+| 运行时定向测试 | `python -m pytest -q tests/runtime/test_service.py -W error::DeprecationWarning` | 13 项通过 | [`test_service.py`](../../tests/runtime/test_service.py) |
+| 全量回归 | `python -m pytest -q -W error::DeprecationWarning` | 32 项通过 | [`tests/`](../../tests) |
 | 类型检查 | `python -m mypy src/researchflow` | 34 个源文件通过 | [`src/researchflow/`](../../src/researchflow) |
 | 静态检查 | `python -m ruff check .` | 通过 | 全仓库 |
 | 格式检查 | `python -m ruff format --check .` | 48 个文件符合格式 | 全仓库 |
@@ -104,3 +113,4 @@ AnyIO 超时只转换自身的 `TimeoutError`；外层仍不捕获 `BaseExceptio
 | --- | --- | --- |
 | 2026-08-14 | 根据合并前审查建立修复记录 | ResearchFlow Agent 团队 |
 | 2026-08-14 | 完成三个阻塞项修复及命令冲突补强，31 项测试通过 | ResearchFlow Agent 团队 |
+| 2026-08-14 | 补齐规划器失败的 FAILED 状态和 run.failed 事件语义，32 项测试通过 | ResearchFlow Agent 团队 |
