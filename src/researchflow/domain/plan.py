@@ -15,6 +15,7 @@ class TaskStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    BLOCKED = "blocked"
     CANCELLED = "cancelled"
 
 

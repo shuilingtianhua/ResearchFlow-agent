@@ -7,8 +7,10 @@ from dataclasses import replace
 from typing import NoReturn
 from uuid import uuid4
 
+from anyio import fail_after
+
 from researchflow.capabilities import CapabilityRegistry, CapabilityRequest, CapabilityResult
-from researchflow.domain.errors import ContractViolation
+from researchflow.domain.errors import ConflictError, ContractViolation
 from researchflow.domain.event import EventDraft, RunEvent, RunEventKind, utc_now
 from researchflow.domain.plan import TaskSpec, TaskStatus
 from researchflow.domain.run import RunSnapshot, RunStatus
@@ -16,6 +18,8 @@ from researchflow.planning import PlanningContext, PlanningModule
 from researchflow.runtime.commands import CancelRun, PauseRun, ResumeRun, RunCommand, StartRun
 from researchflow.runtime.contracts import CommandResult
 from researchflow.runtime.store import RunStore
+
+_COMMIT_ATTEMPTS = 5
 
 
 class RuntimeService:
@@ -83,10 +87,24 @@ class RuntimeService:
         return await self._commit(snapshot, planned, (event,))
 
     async def _pause(self, command: PauseRun) -> CommandResult:
-        snapshot = await self._store.load(command.run_id)
-        if snapshot.status not in {RunStatus.PLANNED, RunStatus.RUNNING}:
-            raise ContractViolation(f"cannot pause a run in {snapshot.status.value!r}")
+        for _ in range(_COMMIT_ATTEMPTS):
+            snapshot = await self._store.load(command.run_id)
+            if snapshot.status == RunStatus.PAUSED:
+                return CommandResult(snapshot)
+            if snapshot.status not in {RunStatus.PLANNED, RunStatus.RUNNING}:
+                raise ContractViolation(f"cannot pause a run in {snapshot.status.value!r}")
 
+            paused, event = self._paused_transition(snapshot, command.reason)
+            try:
+                stored, events = await self._commit_with_events(snapshot, paused, (event,))
+                return CommandResult(stored, events)
+            except ConflictError:
+                continue
+        raise ConflictError(f"pause command for {command.run_id!r} kept conflicting")
+
+    def _paused_transition(
+        self, snapshot: RunSnapshot, reason: str
+    ) -> tuple[RunSnapshot, EventDraft]:
         statuses = dict(snapshot.task_statuses)
         execution_ids = dict(snapshot.task_execution_ids)
         for task_id, status in statuses.items():
@@ -102,65 +120,77 @@ class RuntimeService:
         event = EventDraft(
             kind=RunEventKind.RUN_PAUSED,
             run_id=snapshot.run_id,
-            payload={"reason": command.reason},
+            payload={"reason": reason},
         )
-        stored, events = await self._commit_with_events(snapshot, paused, (event,))
-        return CommandResult(stored, events)
+        return paused, event
 
     async def _resume(self, command: ResumeRun) -> CommandResult:
-        snapshot = await self._store.load(command.run_id)
-        if snapshot.status != RunStatus.PAUSED:
-            raise ContractViolation(f"cannot resume a run in {snapshot.status.value!r}")
-        previous_events = await self._store.list_events(snapshot.run_id)
-        after_sequence = previous_events[-1].sequence if previous_events else 0
-        running = await self._change_run_status(
-            snapshot,
-            RunStatus.RUNNING,
-            RunEventKind.RUN_RESUMED,
-        )
-        final = await self._execute_until_stopped(running.run_id)
-        events = await self._store.list_events(running.run_id, after_sequence)
-        return CommandResult(final, events)
+        for _ in range(_COMMIT_ATTEMPTS):
+            snapshot = await self._store.load(command.run_id)
+            if snapshot.status != RunStatus.PAUSED:
+                raise ContractViolation(f"cannot resume a run in {snapshot.status.value!r}")
+            previous_events = await self._store.list_events(snapshot.run_id)
+            after_sequence = previous_events[-1].sequence if previous_events else 0
+            try:
+                running = await self._change_run_status(
+                    snapshot,
+                    RunStatus.RUNNING,
+                    RunEventKind.RUN_RESUMED,
+                )
+            except ConflictError:
+                continue
+            final = await self._execute_until_stopped(running.run_id)
+            events = await self._store.list_events(running.run_id, after_sequence)
+            return CommandResult(final, events)
+        raise ConflictError(f"resume command for {command.run_id!r} kept conflicting")
 
     async def _cancel(self, command: CancelRun) -> CommandResult:
-        snapshot = await self._store.load(command.run_id)
-        if snapshot.status == RunStatus.CANCELLED:
-            return CommandResult(snapshot)
-        if snapshot.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}:
-            raise ContractViolation(f"cannot cancel a run in {snapshot.status.value!r}")
+        for _ in range(_COMMIT_ATTEMPTS):
+            snapshot = await self._store.load(command.run_id)
+            if snapshot.status == RunStatus.CANCELLED:
+                return CommandResult(snapshot)
+            if snapshot.status in {RunStatus.SUCCEEDED, RunStatus.FAILED}:
+                raise ContractViolation(f"cannot cancel a run in {snapshot.status.value!r}")
 
-        statuses = {
-            task_id: status if status == TaskStatus.SUCCEEDED else TaskStatus.CANCELLED
-            for task_id, status in snapshot.task_statuses.items()
-        }
-        cancelled = replace(
-            snapshot,
-            status=RunStatus.CANCELLED,
-            task_statuses=statuses,
-            task_execution_ids={},
-        )
-        event = EventDraft(
-            kind=RunEventKind.RUN_CANCELLED,
-            run_id=snapshot.run_id,
-            payload={"reason": command.reason},
-        )
-        stored, events = await self._commit_with_events(snapshot, cancelled, (event,))
-        return CommandResult(stored, events)
+            statuses = {
+                task_id: status if status == TaskStatus.SUCCEEDED else TaskStatus.CANCELLED
+                for task_id, status in snapshot.task_statuses.items()
+            }
+            cancelled = replace(
+                snapshot,
+                status=RunStatus.CANCELLED,
+                task_statuses=statuses,
+                task_execution_ids={},
+            )
+            event = EventDraft(
+                kind=RunEventKind.RUN_CANCELLED,
+                run_id=snapshot.run_id,
+                payload={"reason": command.reason},
+            )
+            try:
+                stored, events = await self._commit_with_events(snapshot, cancelled, (event,))
+                return CommandResult(stored, events)
+            except ConflictError:
+                continue
+        raise ConflictError(f"cancel command for {command.run_id!r} kept conflicting")
 
     async def _execute_until_stopped(self, run_id: str) -> RunSnapshot:
         while True:
             snapshot = await self._store.load(run_id)
             if snapshot.status != RunStatus.RUNNING:
                 return snapshot
-            if self._all_tasks_succeeded(snapshot):
-                return await self._complete(snapshot)
+            try:
+                if self._all_tasks_succeeded(snapshot):
+                    return await self._complete(snapshot)
 
-            task = self._next_runnable_task(snapshot)
-            if task is None:
-                return await self._fail_blocked_run(snapshot)
-            if snapshot.task_statuses[task.task_id] == TaskStatus.PENDING:
-                snapshot = await self._mark_ready(snapshot, task)
-            await self._execute_task(snapshot, task)
+                task = self._next_runnable_task(snapshot)
+                if task is None:
+                    return await self._fail_blocked_run(snapshot)
+                if snapshot.task_statuses[task.task_id] == TaskStatus.PENDING:
+                    snapshot = await self._mark_ready(snapshot, task)
+                await self._execute_task(snapshot, task)
+            except ConflictError:
+                continue
 
     def _next_runnable_task(self, snapshot: RunSnapshot) -> TaskSpec | None:
         if snapshot.plan is None:
@@ -200,17 +230,39 @@ class RuntimeService:
             payload={"attempt": attempt, "capability": task.capability},
         )
         running = await self._commit(snapshot, running, (event,))
+        timeout_seconds, timeout_message = self._execution_timeout(running, task)
 
         try:
-            result = await self._capabilities.invoke(
-                task.capability,
-                self._capability_request(running, task, execution_id),
+            if timeout_seconds <= 0:
+                raise TimeoutError(timeout_message)
+            with fail_after(timeout_seconds):
+                result = await self._capabilities.invoke(
+                    task.capability,
+                    self._capability_request(running, task, execution_id),
+                )
+        except TimeoutError:
+            await self._record_task_failure(
+                running.run_id,
+                task,
+                execution_id,
+                TimeoutError(timeout_message),
             )
+            return
         # Capability implementations are an extension boundary; crashes become run evidence.
         except Exception as exc:  # noqa: BLE001
             await self._record_task_failure(running.run_id, task, execution_id, exc)
             return
         await self._record_task_success(running.run_id, task, execution_id, result)
+
+    def _execution_timeout(self, snapshot: RunSnapshot, task: TaskSpec) -> tuple[float, str]:
+        elapsed = max(0.0, (utc_now() - snapshot.created_at).total_seconds())
+        remaining_budget = snapshot.budget.max_wall_seconds - elapsed
+        if remaining_budget <= task.timeout_seconds:
+            return (
+                max(0.0, remaining_budget),
+                f"run wall-clock budget of {snapshot.budget.max_wall_seconds:g} seconds exhausted",
+            )
+        return task.timeout_seconds, f"task timed out after {task.timeout_seconds:g} seconds"
 
     def _task_running(
         self, snapshot: RunSnapshot, task: TaskSpec, execution_id: str
@@ -250,11 +302,25 @@ class RuntimeService:
         execution_id: str,
         result: CapabilityResult,
     ) -> None:
-        snapshot = await self._store.load(run_id)
-        if not self._is_active_execution(snapshot, task.task_id, execution_id):
-            await self._record_ignored_result(snapshot, task.task_id, execution_id)
-            return
+        for _ in range(_COMMIT_ATTEMPTS):
+            snapshot = await self._store.load(run_id)
+            try:
+                if not self._is_active_execution(snapshot, task.task_id, execution_id):
+                    await self._record_ignored_result(snapshot, task.task_id, execution_id)
+                    return
+                await self._commit_task_success(snapshot, task, execution_id, result)
+                return
+            except ConflictError:
+                continue
+        raise ConflictError(f"task result for {task.task_id!r} kept conflicting")
 
+    async def _commit_task_success(
+        self,
+        snapshot: RunSnapshot,
+        task: TaskSpec,
+        execution_id: str,
+        result: CapabilityResult,
+    ) -> None:
         statuses = dict(snapshot.task_statuses)
         statuses[task.task_id] = TaskStatus.SUCCEEDED
         outputs = dict(snapshot.task_outputs)
@@ -272,7 +338,7 @@ class RuntimeService:
         )
         event = EventDraft(
             kind=RunEventKind.TASK_SUCCEEDED,
-            run_id=run_id,
+            run_id=snapshot.run_id,
             task_id=task.task_id,
             execution_id=execution_id,
             payload={"output_keys": sorted(result.outputs)},
@@ -286,16 +352,22 @@ class RuntimeService:
         execution_id: str,
         error: Exception,
     ) -> None:
-        snapshot = await self._store.load(run_id)
-        if not self._is_active_execution(snapshot, task.task_id, execution_id):
-            await self._record_ignored_result(snapshot, task.task_id, execution_id)
-            return
+        for _ in range(_COMMIT_ATTEMPTS):
+            snapshot = await self._store.load(run_id)
+            try:
+                if not self._is_active_execution(snapshot, task.task_id, execution_id):
+                    await self._record_ignored_result(snapshot, task.task_id, execution_id)
+                    return
 
-        message = str(error) or type(error).__name__
-        if snapshot.task_attempts[task.task_id] < task.max_attempts:
-            await self._retry_task(snapshot, task, execution_id, message)
-            return
-        await self._fail_task_and_run(snapshot, task, execution_id, error, message)
+                message = str(error) or type(error).__name__
+                if snapshot.task_attempts[task.task_id] < task.max_attempts:
+                    await self._retry_task(snapshot, task, execution_id, message)
+                    return
+                await self._fail_task_and_run(snapshot, task, execution_id, error, message)
+                return
+            except ConflictError:
+                continue
+        raise ConflictError(f"task failure for {task.task_id!r} kept conflicting")
 
     async def _retry_task(
         self, snapshot: RunSnapshot, task: TaskSpec, execution_id: str, message: str
@@ -329,8 +401,14 @@ class RuntimeService:
         error: Exception,
         message: str,
     ) -> None:
+        blocked_task_ids = self._blocked_descendants(snapshot, task.task_id)
         statuses = {
-            task_id: self._terminal_task_status(task_id, status, task.task_id)
+            task_id: self._terminal_task_status(
+                task_id,
+                status,
+                task.task_id,
+                blocked_task_ids,
+            )
             for task_id, status in snapshot.task_statuses.items()
         }
         errors = dict(snapshot.task_errors)
@@ -359,13 +437,33 @@ class RuntimeService:
         await self._commit(snapshot, failed, events)
 
     def _terminal_task_status(
-        self, task_id: str, status: TaskStatus, failed_task_id: str
+        self,
+        task_id: str,
+        status: TaskStatus,
+        failed_task_id: str,
+        blocked_task_ids: set[str],
     ) -> TaskStatus:
         if task_id == failed_task_id:
             return TaskStatus.FAILED
         if status == TaskStatus.SUCCEEDED:
             return status
+        if task_id in blocked_task_ids:
+            return TaskStatus.BLOCKED
         return TaskStatus.CANCELLED
+
+    def _blocked_descendants(self, snapshot: RunSnapshot, failed_task_id: str) -> set[str]:
+        if snapshot.plan is None:
+            return set()
+        blocked = {failed_task_id}
+        while True:
+            expanded = blocked | {
+                task.task_id
+                for task in snapshot.plan.tasks
+                if any(dependency in blocked for dependency in task.dependencies)
+            }
+            if expanded == blocked:
+                return blocked - {failed_task_id}
+            blocked = expanded
 
     def _is_active_execution(self, snapshot: RunSnapshot, task_id: str, execution_id: str) -> bool:
         return (
@@ -395,7 +493,7 @@ class RuntimeService:
 
     async def _fail_blocked_run(self, snapshot: RunSnapshot) -> RunSnapshot:
         statuses = {
-            task_id: status if status == TaskStatus.SUCCEEDED else TaskStatus.CANCELLED
+            task_id: status if status == TaskStatus.SUCCEEDED else TaskStatus.BLOCKED
             for task_id, status in snapshot.task_statuses.items()
         }
         failed = replace(snapshot, status=RunStatus.FAILED, task_statuses=statuses)

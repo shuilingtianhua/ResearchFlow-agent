@@ -1,20 +1,28 @@
 import asyncio
+from dataclasses import replace
 
 from researchflow.adapters.capabilities import FakeCapability
 from researchflow.adapters.persistence import InMemoryRunStore
 from researchflow.capabilities import CapabilityRegistry, CapabilityRequest, CapabilityResult
 from researchflow.domain.errors import ExecutionFailure
-from researchflow.domain.event import RunEventKind
+from researchflow.domain.event import EventDraft, RunEvent, RunEventKind
 from researchflow.domain.plan import PlanDefinition, TaskSpec, TaskStatus
-from researchflow.domain.run import RunStatus
+from researchflow.domain.run import RunBudget, RunSnapshot, RunStatus
 from researchflow.planning import FixedResearchPlanner, PlanningContext
 from researchflow.runtime import CancelRun, PauseRun, ResumeRun, RuntimeService, StartRun
 
 
 class SingleTaskPlanner:
-    def __init__(self, capability_name: str, *, max_attempts: int = 1) -> None:
+    def __init__(
+        self,
+        capability_name: str,
+        *,
+        max_attempts: int = 1,
+        timeout_seconds: float = 300.0,
+    ) -> None:
         self._capability_name = capability_name
         self._max_attempts = max_attempts
+        self._timeout_seconds = timeout_seconds
 
     async def build(self, context: PlanningContext) -> PlanDefinition:
         return PlanDefinition(
@@ -25,6 +33,7 @@ class SingleTaskPlanner:
                     title="Controlled task",
                     capability=self._capability_name,
                     max_attempts=self._max_attempts,
+                    timeout_seconds=self._timeout_seconds,
                 ),
             ),
         )
@@ -47,6 +56,66 @@ class BlockingCapability:
             self.started.set()
             await self.release.wait()
         return CapabilityResult(outputs={"invocation": self.invocation_count})
+
+
+class PauseBeforeResultStore(InMemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.injected = False
+
+    async def commit(
+        self,
+        snapshot: RunSnapshot,
+        events: tuple[EventDraft, ...],
+        *,
+        expected_version: int,
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
+        result_kinds = {RunEventKind.TASK_SUCCEEDED, RunEventKind.TASK_FAILED}
+        is_task_result = any(event.kind in result_kinds for event in events)
+        if is_task_result and not self.injected:
+            self.injected = True
+            current = await self.load(snapshot.run_id)
+            task_id = next(iter(current.task_execution_ids))
+            statuses = dict(current.task_statuses)
+            statuses[task_id] = TaskStatus.READY
+            paused = replace(
+                current,
+                status=RunStatus.PAUSED,
+                version=current.version + 1,
+                task_statuses=statuses,
+                task_execution_ids={},
+            )
+            await super().commit(
+                paused,
+                (EventDraft(kind=RunEventKind.RUN_PAUSED, run_id=snapshot.run_id),),
+                expected_version=current.version,
+            )
+        return await super().commit(snapshot, events, expected_version=expected_version)
+
+
+class VersionBumpBeforePauseStore(InMemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.bumped = False
+
+    async def commit(
+        self,
+        snapshot: RunSnapshot,
+        events: tuple[EventDraft, ...],
+        *,
+        expected_version: int,
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
+        is_pause = any(event.kind == RunEventKind.RUN_PAUSED for event in events)
+        if is_pause and not self.bumped:
+            self.bumped = True
+            current = await self.load(snapshot.run_id)
+            bumped = replace(current, version=current.version + 1)
+            await super().commit(
+                bumped,
+                (EventDraft(kind="run.concurrent_update", run_id=snapshot.run_id),),
+                expected_version=current.version,
+            )
+        return await super().commit(snapshot, events, expected_version=expected_version)
 
 
 def test_runtime_executes_dependencies_in_order() -> None:
@@ -83,7 +152,7 @@ def test_runtime_executes_dependencies_in_order() -> None:
     asyncio.run(scenario())
 
 
-def test_runtime_records_failure_and_cancels_downstream_tasks() -> None:
+def test_runtime_records_failure_and_blocks_downstream_tasks() -> None:
     async def scenario() -> None:
         runtime = RuntimeService(
             store=InMemoryRunStore(),
@@ -103,13 +172,147 @@ def test_runtime_records_failure_and_cancels_downstream_tasks() -> None:
         assert result.snapshot.task_statuses == {
             "collect_sources": TaskStatus.SUCCEEDED,
             "prepare_experiment": TaskStatus.FAILED,
-            "write_report": TaskStatus.CANCELLED,
+            "write_report": TaskStatus.BLOCKED,
         }
         assert result.snapshot.task_errors == {"prepare_experiment": "experiment failed"}
         assert [event.kind for event in result.emitted_events[-2:]] == [
             RunEventKind.TASK_FAILED,
             RunEventKind.RUN_FAILED,
         ]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_only_blocks_descendants_of_the_failed_task() -> None:
+    class BranchedPlanner:
+        async def build(self, context: PlanningContext) -> PlanDefinition:
+            return PlanDefinition(
+                plan_id=f"{context.run_id}-plan",
+                tasks=(
+                    TaskSpec(task_id="root", title="Root", capability="broken"),
+                    TaskSpec(
+                        task_id="dependent",
+                        title="Dependent",
+                        capability="unused",
+                        dependencies=("root",),
+                    ),
+                    TaskSpec(task_id="independent", title="Independent", capability="unused"),
+                ),
+            )
+
+    async def scenario() -> None:
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=BranchedPlanner(),
+            capabilities=CapabilityRegistry(
+                (
+                    FakeCapability("broken", failure_message="root failed"),
+                    FakeCapability("unused"),
+                )
+            ),
+        )
+
+        result = await runtime.dispatch(StartRun(run_id="run-1", goal="Reproduce a paper"))
+
+        assert result.snapshot.task_statuses == {
+            "root": TaskStatus.FAILED,
+            "dependent": TaskStatus.BLOCKED,
+            "independent": TaskStatus.CANCELLED,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_runtime_enforces_task_timeout() -> None:
+    async def scenario() -> None:
+        capability = BlockingCapability("controlled")
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=SingleTaskPlanner(capability.name, timeout_seconds=0.01),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+
+        result = await asyncio.wait_for(
+            runtime.dispatch(StartRun(run_id="run-1", goal="Reproduce a paper")),
+            timeout=1,
+        )
+
+        assert result.snapshot.status == RunStatus.FAILED
+        assert "timed out after" in result.snapshot.task_errors["controlled_task"]
+        failed = next(
+            event for event in result.emitted_events if event.kind == RunEventKind.TASK_FAILED
+        )
+        assert failed.payload["error_type"] == "TimeoutError"
+
+    asyncio.run(scenario())
+
+
+def test_runtime_enforces_run_wall_clock_budget() -> None:
+    async def scenario() -> None:
+        capability = BlockingCapability("controlled")
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=SingleTaskPlanner(capability.name, timeout_seconds=10),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+
+        result = await asyncio.wait_for(
+            runtime.dispatch(
+                StartRun(
+                    run_id="run-1",
+                    goal="Reproduce a paper",
+                    budget=RunBudget(max_wall_seconds=0.01),
+                )
+            ),
+            timeout=1,
+        )
+
+        assert result.snapshot.status == RunStatus.FAILED
+        assert "wall-clock budget" in result.snapshot.task_errors["controlled_task"]
+
+    asyncio.run(scenario())
+
+
+def test_result_conflict_is_reloaded_and_recorded_as_ignored() -> None:
+    async def scenario() -> None:
+        store = PauseBeforeResultStore()
+        runtime = RuntimeService(
+            store=store,
+            planner=SingleTaskPlanner("controlled"),
+            capabilities=CapabilityRegistry((FakeCapability("controlled"),)),
+        )
+
+        result = await runtime.dispatch(StartRun(run_id="run-1", goal="Reproduce a paper"))
+
+        assert store.injected
+        assert result.snapshot.status == RunStatus.PAUSED
+        assert result.snapshot.task_statuses["controlled_task"] == TaskStatus.READY
+        assert any(
+            event.kind == RunEventKind.TASK_RESULT_IGNORED for event in result.emitted_events
+        )
+
+    asyncio.run(scenario())
+
+
+def test_failure_conflict_is_reloaded_and_recorded_as_ignored() -> None:
+    async def scenario() -> None:
+        store = PauseBeforeResultStore()
+        runtime = RuntimeService(
+            store=store,
+            planner=SingleTaskPlanner("controlled"),
+            capabilities=CapabilityRegistry(
+                (FakeCapability("controlled", failure_message="late failure"),)
+            ),
+        )
+
+        result = await runtime.dispatch(StartRun(run_id="run-1", goal="Reproduce a paper"))
+
+        assert store.injected
+        assert result.snapshot.status == RunStatus.PAUSED
+        assert result.snapshot.task_errors == {}
+        assert any(
+            event.kind == RunEventKind.TASK_RESULT_IGNORED for event in result.emitted_events
+        )
 
     asyncio.run(scenario())
 
@@ -142,6 +345,33 @@ def test_pause_invalidates_late_result_and_resume_reexecutes_task() -> None:
         assert resumed.snapshot.status == RunStatus.SUCCEEDED
         assert capability.invocation_count == 2
         assert resumed.snapshot.task_outputs["controlled_task"] == {"invocation": 2}
+
+    asyncio.run(scenario())
+
+
+def test_pause_reloads_and_retries_after_a_version_conflict() -> None:
+    async def scenario() -> None:
+        capability = BlockingCapability("controlled")
+        store = VersionBumpBeforePauseStore()
+        runtime = RuntimeService(
+            store=store,
+            planner=SingleTaskPlanner(capability.name),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+        running = asyncio.create_task(
+            runtime.dispatch(StartRun(run_id="run-1", goal="Reproduce a paper"))
+        )
+        await capability.started.wait()
+
+        paused = await runtime.dispatch(PauseRun(run_id="run-1"))
+        capability.release.set()
+        await running
+
+        assert store.bumped
+        assert paused.snapshot.status == RunStatus.PAUSED
+        assert [event.kind for event in await store.list_events("run-1")].count(
+            RunEventKind.RUN_PAUSED
+        ) == 1
 
     asyncio.run(scenario())
 

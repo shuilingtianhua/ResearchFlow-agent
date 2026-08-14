@@ -28,6 +28,9 @@ $env:RESEARCHFLOW_DATABASE_URL = "sqlite+aiosqlite:///D:/data/researchflow.db"
 python -m researchflow
 ```
 
+运行时会执行节点超时和 Run 墙钟预算；上游失败的依赖后代标记为 `blocked`；暂停或取消与
+任务结果竞争时，旧结果不会覆盖新状态，并会留下 `task.result_ignored` 事件。
+
 ## 当前 API
 
 ```text
