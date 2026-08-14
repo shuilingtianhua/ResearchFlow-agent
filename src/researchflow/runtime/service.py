@@ -179,18 +179,24 @@ class RuntimeService:
             snapshot = await self._store.load(run_id)
             if snapshot.status != RunStatus.RUNNING:
                 return snapshot
-            try:
-                if self._all_tasks_succeeded(snapshot):
+            if self._all_tasks_succeeded(snapshot):
+                try:
                     return await self._complete(snapshot)
+                except ConflictError:
+                    continue
 
-                task = self._next_runnable_task(snapshot)
-                if task is None:
+            task = self._next_runnable_task(snapshot)
+            if task is None:
+                try:
                     return await self._fail_blocked_run(snapshot)
-                if snapshot.task_statuses[task.task_id] == TaskStatus.PENDING:
+                except ConflictError:
+                    continue
+            if snapshot.task_statuses[task.task_id] == TaskStatus.PENDING:
+                try:
                     snapshot = await self._mark_ready(snapshot, task)
-                await self._execute_task(snapshot, task)
-            except ConflictError:
-                continue
+                except ConflictError:
+                    continue
+            await self._execute_task(snapshot, task)
 
     def _next_runnable_task(self, snapshot: RunSnapshot) -> TaskSpec | None:
         if snapshot.plan is None:
@@ -229,7 +235,10 @@ class RuntimeService:
             execution_id=execution_id,
             payload={"attempt": attempt, "capability": task.capability},
         )
-        running = await self._commit(snapshot, running, (event,))
+        try:
+            running = await self._commit(snapshot, running, (event,))
+        except ConflictError:
+            return
         timeout_seconds, timeout_message = self._execution_timeout(running, task)
 
         try:
