@@ -57,16 +57,12 @@ class InMemoryRunStore:
             self._snapshots[snapshot.run_id] = deepcopy(snapshot)
             return deepcopy(snapshot), deepcopy(stored_events)
 
-    async def list_events(
-        self, run_id: str, after_sequence: int = 0
-    ) -> tuple[RunEvent, ...]:
+    async def list_events(self, run_id: str, after_sequence: int = 0) -> tuple[RunEvent, ...]:
         async with self._lock:
             if run_id not in self._snapshots:
                 raise NotFoundError(f"run {run_id!r} was not found")
             return tuple(
-                deepcopy(event)
-                for event in self._events[run_id]
-                if event.sequence > after_sequence
+                deepcopy(event) for event in self._events[run_id] if event.sequence > after_sequence
             )
 
     def _append(self, run_id: str, drafts: tuple[EventDraft, ...]) -> tuple[RunEvent, ...]:

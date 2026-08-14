@@ -103,7 +103,7 @@ AutoResearch 与普通任务执行分离，因为它拥有独立的可信计算�
 
 ## 6. 数据与一致性
 
-领域对象使用不可变 dataclass；API 和外部文件使用 Pydantic 做版本化校验。首版持久化目标是 SQLite + SQLAlchemy Async，后续可替换 PostgreSQL。
+领域对象使用不可变 dataclass；API 和外部文件使用 Pydantic 做版本化校验。当前已经使用 SQLite + SQLAlchemy Async 持久化 Run 快照和事件，后续可在保持 `RunStore` 端口的前提下替换 PostgreSQL。
 
 `RunStore` 采用乐观并发：
 
@@ -164,7 +164,7 @@ ResearchFlow-Agent/
 
 ## 10. 实施顺序
 
-1. **运行闭环**：提交目标、生成固定计划、执行 Fake Capability、持久化状态、SSE 观察事件。
+1. **运行闭环**：提交目标、生成固定计划、执行 Fake Capability、持久化状态；当前已完成，SSE 仍待实现。
 2. **真实执行**：Docker Sandbox、Git 仓库、产物存储、租约与恢复。
 3. **科研能力**：Librarian、Coder、Data 与证据化报告。
 4. **配置型 AutoResearch**：有限搜索空间、TrialLedger、Search/Holdout。

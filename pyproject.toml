@@ -9,10 +9,12 @@ description = "A Python multi-agent research execution system."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aiosqlite>=0.20,<1",
     "anyio>=4,<5",
     "fastapi>=0.115,<1",
     "httpx>=0.27,<1",
     "pydantic>=2.10,<3",
+    "sqlalchemy[asyncio]>=2.0,<3",
     "uvicorn[standard]>=0.32,<1",
 ]
 
@@ -23,11 +25,6 @@ dev = [
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.8,<1",
 ]
-persistence = [
-    "aiosqlite>=0.20,<1",
-    "sqlalchemy[asyncio]>=2.0,<3",
-]
-
 [project.scripts]
 researchflow = "researchflow.__main__:main"
 

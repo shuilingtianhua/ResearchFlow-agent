@@ -941,9 +941,11 @@ stateDiagram-v2
 5. Hidden Holdout 由用户上传、服务端托管还是独立 evaluator 服务提供。
 6. MVP 是否需要独立前端，还是先使用接口、SSE 和简易工作台。
 7. 默认沙箱网络策略以及仓库下载由宿主侧还是沙箱侧完成。
-8. MVP 状态存储采用 SQLite 还是直接使用 PostgreSQL。
-9. 首批支持的模型供应商和默认模型。
-10. 项目最终许可证以及对参考项目的署名方式。
+8. 首批支持的模型供应商和默认模型。
+9. 项目最终许可证以及对参考项目的署名方式。
+
+已确认决策：MVP 状态存储采用 SQLite + SQLAlchemy Async，保持 `RunStore` 端口以便后续
+切换 PostgreSQL。
 
 ---
 

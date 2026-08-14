@@ -2,6 +2,7 @@
 
 from researchflow.runtime.commands import CancelRun, PauseRun, ResumeRun, StartRun
 from researchflow.runtime.contracts import CommandResult, ResearchRuntime
+from researchflow.runtime.service import RuntimeService
 from researchflow.runtime.store import RunStore
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "ResearchRuntime",
     "ResumeRun",
     "RunStore",
+    "RuntimeService",
     "StartRun",
 ]

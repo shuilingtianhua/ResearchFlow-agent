@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping, TypeAlias
+from typing import TypeAlias
 
+from researchflow.domain.errors import ContractViolation
 from researchflow.domain.run import RunBudget
 
 
@@ -14,6 +16,10 @@ class StartRun:
     goal: str
     inputs: Mapping[str, object] = field(default_factory=dict)
     budget: RunBudget = field(default_factory=RunBudget)
+
+    def __post_init__(self) -> None:
+        if not self.run_id or not self.goal.strip():
+            raise ContractViolation("run_id and goal are required")
 
 
 @dataclass(frozen=True, slots=True)
