@@ -123,6 +123,123 @@ class VersionBumpBeforePauseStore(InMemoryRunStore):
         return await super().commit(snapshot, events, expected_version=expected_version)
 
 
+def interrupted_snapshot() -> RunSnapshot:
+    plan = PlanDefinition(
+        plan_id="recovery-plan",
+        tasks=(
+            TaskSpec(task_id="completed", title="Completed", capability="completed"),
+            TaskSpec(
+                task_id="interrupted",
+                title="Interrupted",
+                capability="interrupted",
+                dependencies=("completed",),
+                max_attempts=2,
+            ),
+        ),
+    )
+    return RunSnapshot(
+        run_id="interrupted-run",
+        goal="Resume interrupted research",
+        status=RunStatus.RUNNING,
+        plan=plan,
+        task_statuses={
+            "completed": TaskStatus.SUCCEEDED,
+            "interrupted": TaskStatus.RUNNING,
+        },
+        task_outputs={"completed": {"summary": "preserved"}},
+        task_attempts={"completed": 1, "interrupted": 1},
+        task_execution_ids={"interrupted": "old-execution"},
+    )
+
+
+def test_runtime_recovers_interrupted_run_to_safe_paused_state() -> None:
+    async def scenario() -> None:
+        store = InMemoryRunStore()
+        snapshot = interrupted_snapshot()
+        await store.create(snapshot)
+        runtime = RuntimeService(
+            store=store,
+            planner=FixedResearchPlanner(),
+            capabilities=CapabilityRegistry(
+                (FakeCapability("completed"), FakeCapability("interrupted"))
+            ),
+        )
+
+        recovered_count = await runtime.recover_interrupted_runs()
+
+        recovered = await runtime.get(snapshot.run_id)
+        assert recovered_count == 1
+        assert recovered.status == RunStatus.PAUSED
+        assert recovered.task_statuses == {
+            "completed": TaskStatus.SUCCEEDED,
+            "interrupted": TaskStatus.READY,
+        }
+        assert recovered.task_outputs == {"completed": {"summary": "preserved"}}
+        assert recovered.task_attempts == {"completed": 1, "interrupted": 1}
+        assert recovered.task_execution_ids == {}
+        events = [event async for event in runtime.events(snapshot.run_id)]
+        assert [event.kind for event in events] == [RunEventKind.RUN_RECOVERED]
+        assert events[0].payload == {
+            "previous_status": "running",
+            "reason": "process_restart",
+            "invalidated_execution_count": 1,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_runtime_recovery_is_idempotent() -> None:
+    async def scenario() -> None:
+        store = InMemoryRunStore()
+        snapshot = interrupted_snapshot()
+        await store.create(snapshot)
+        runtime = RuntimeService(
+            store=store,
+            planner=FixedResearchPlanner(),
+            capabilities=CapabilityRegistry(
+                (FakeCapability("completed"), FakeCapability("interrupted"))
+            ),
+        )
+
+        assert await runtime.recover_interrupted_runs() == 1
+        first_recovery = await runtime.get(snapshot.run_id)
+        assert await runtime.recover_interrupted_runs() == 0
+
+        assert await runtime.get(snapshot.run_id) == first_recovery
+        events = [event async for event in runtime.events(snapshot.run_id)]
+        assert [event.kind for event in events].count(RunEventKind.RUN_RECOVERED) == 1
+
+    asyncio.run(scenario())
+
+
+def test_recovery_invalidates_late_result() -> None:
+    async def scenario() -> None:
+        capability = BlockingCapability("controlled")
+        store = InMemoryRunStore()
+        runtime = RuntimeService(
+            store=store,
+            planner=SingleTaskPlanner(capability.name, max_attempts=2),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+        running = asyncio.create_task(
+            runtime.dispatch(StartRun(run_id="run-1", goal="Reproduce a paper"))
+        )
+        await capability.started.wait()
+
+        assert await runtime.recover_interrupted_runs() == 1
+        capability.release.set()
+        stopped = await running
+
+        assert stopped.snapshot.status == RunStatus.PAUSED
+        assert stopped.snapshot.task_statuses["controlled_task"] == TaskStatus.READY
+        assert stopped.snapshot.task_outputs == {}
+        assert any(
+            event.kind == RunEventKind.TASK_RESULT_IGNORED for event in stopped.emitted_events
+        )
+
+    asyncio.run(scenario())
+
+
 def test_runtime_executes_dependencies_in_order() -> None:
     async def scenario() -> None:
         librarian = FakeCapability("librarian")

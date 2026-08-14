@@ -7,7 +7,7 @@ from copy import deepcopy
 
 from researchflow.domain.errors import ConflictError, ContractViolation, NotFoundError
 from researchflow.domain.event import EventDraft, RunEvent
-from researchflow.domain.run import RunSnapshot
+from researchflow.domain.run import RunSnapshot, RunStatus
 
 
 class InMemoryRunStore:
@@ -34,6 +34,14 @@ class InMemoryRunStore:
                 return deepcopy(self._snapshots[run_id])
             except KeyError as exc:
                 raise NotFoundError(f"run {run_id!r} was not found") from exc
+
+    async def list_by_status(self, statuses: frozenset[RunStatus]) -> tuple[RunSnapshot, ...]:
+        async with self._lock:
+            return tuple(
+                deepcopy(snapshot)
+                for run_id, snapshot in sorted(self._snapshots.items())
+                if snapshot.status in statuses
+            )
 
     async def commit(
         self,

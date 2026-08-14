@@ -51,6 +51,37 @@ class RuntimeService:
         for event in await self._store.list_events(run_id, after_sequence):
             yield event
 
+    async def recover_interrupted_runs(self) -> int:
+        snapshots = await self._store.list_by_status(frozenset({RunStatus.RUNNING}))
+        recovered_count = 0
+        for snapshot in snapshots:
+            if await self._recover_interrupted_run(snapshot.run_id):
+                recovered_count += 1
+        return recovered_count
+
+    async def _recover_interrupted_run(self, run_id: str) -> bool:
+        for _ in range(_COMMIT_ATTEMPTS):
+            snapshot = await self._store.load(run_id)
+            if snapshot.status != RunStatus.RUNNING:
+                return False
+
+            paused, _ = self._paused_transition(snapshot, "process_restart")
+            event = EventDraft(
+                kind=RunEventKind.RUN_RECOVERED,
+                run_id=snapshot.run_id,
+                payload={
+                    "previous_status": snapshot.status.value,
+                    "reason": "process_restart",
+                    "invalidated_execution_count": len(snapshot.task_execution_ids),
+                },
+            )
+            try:
+                await self._commit(snapshot, paused, (event,))
+                return True
+            except ConflictError:
+                continue
+        raise ConflictError(f"recovery for {run_id!r} kept conflicting")
+
     async def _start(self, command: StartRun) -> CommandResult:
         created = RunSnapshot(run_id=command.run_id, goal=command.goal, budget=command.budget)
         await self._store.create(

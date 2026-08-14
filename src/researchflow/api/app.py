@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from fastapi import FastAPI, Request, status
@@ -15,7 +17,13 @@ from researchflow.settings import Settings
 
 def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.from_env()
-    app = FastAPI(title=resolved.app_name, version="0.0.0")
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await runtime.recover_interrupted_runs()
+        yield
+
+    app = FastAPI(title=resolved.app_name, version="0.0.0", lifespan=lifespan)
     app.state.runtime = runtime
 
     @app.exception_handler(NotFoundError)

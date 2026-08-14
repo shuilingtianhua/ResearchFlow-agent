@@ -33,7 +33,7 @@ from researchflow.domain.errors import (
     NotFoundError,
 )
 from researchflow.domain.event import EventDraft, RunEvent
-from researchflow.domain.run import RunSnapshot
+from researchflow.domain.run import RunSnapshot, RunStatus
 
 _metadata = MetaData()
 _runs = Table(
@@ -110,6 +110,18 @@ class SQLiteRunStore:
         if snapshot_json is None:
             raise NotFoundError(f"run {run_id!r} was not found")
         return _deserialize_snapshot(snapshot_json)
+
+    async def list_by_status(self, statuses: frozenset[RunStatus]) -> tuple[RunSnapshot, ...]:
+        await self._ensure_initialized()
+        try:
+            async with self._engine.connect() as connection:
+                rows = await connection.execute(
+                    select(_runs.c.snapshot_json).order_by(_runs.c.run_id)
+                )
+        except DBAPIError as exc:
+            raise _database_error(exc) from exc
+        snapshots = (_deserialize_snapshot(value) for value in rows.scalars())
+        return tuple(snapshot for snapshot in snapshots if snapshot.status in statuses)
 
     async def commit(
         self,

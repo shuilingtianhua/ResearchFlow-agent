@@ -62,10 +62,11 @@ flowchart LR
 
 ### 5.1 Research Runtime
 
-运行时只暴露三个概念：提交命令、读取快照、订阅事件。
+运行时面向业务调用暴露提交命令、读取快照和订阅事件；另提供一个由进程生命周期调用的中断恢复入口。
 
 ```python
 class ResearchRuntime(Protocol):
+    async def recover_interrupted_runs(self) -> int: ...
     async def dispatch(self, command: RunCommand) -> CommandResult: ...
     async def get(self, run_id: str) -> RunSnapshot: ...
     def events(self, run_id: str, after_sequence: int = 0) -> AsyncIterator[RunEvent]: ...
@@ -78,6 +79,7 @@ class ResearchRuntime(Protocol):
 3. 快照与事件通过 `RunStore.commit()` 原子提交，并使用版本号处理并发冲突。
 4. 暂停、取消和预算耗尽必须通过显式状态迁移传播，不能只停止 HTTP 请求。
 5. 重试必须遵守任务策略和总预算。
+6. 进程启动恢复只能把中断执行转换为安全状态，不能复用旧执行身份或在 API/存储适配器中实现状态规则。
 
 ### 5.2 Planning
 

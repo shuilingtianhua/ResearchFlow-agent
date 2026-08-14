@@ -47,6 +47,27 @@ def test_store_rejects_a_stale_version() -> None:
     asyncio.run(scenario())
 
 
+def test_store_lists_only_snapshots_with_requested_status() -> None:
+    async def scenario() -> None:
+        store = InMemoryRunStore()
+        running = RunSnapshot(
+            run_id="running-run",
+            goal="Resume research",
+            status=RunStatus.RUNNING,
+        )
+        completed = RunSnapshot(
+            run_id="completed-run",
+            goal="Completed research",
+            status=RunStatus.SUCCEEDED,
+        )
+        await store.create(running)
+        await store.create(completed)
+
+        assert await store.list_by_status(frozenset({RunStatus.RUNNING})) == (running,)
+
+    asyncio.run(scenario())
+
+
 def test_store_does_not_partially_append_invalid_events() -> None:
     async def scenario() -> None:
         store = InMemoryRunStore()

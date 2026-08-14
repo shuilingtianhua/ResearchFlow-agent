@@ -16,6 +16,7 @@ class RunEventKind(StrEnum):
     RUN_CREATED = "run.created"
     PLAN_CREATED = "plan.created"
     RUN_STARTED = "run.started"
+    RUN_RECOVERED = "run.recovered"
     RUN_PAUSED = "run.paused"
     RUN_RESUMED = "run.resumed"
     RUN_CANCELLED = "run.cancelled"

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from researchflow.domain.event import EventDraft, RunEvent
-from researchflow.domain.run import RunSnapshot
+from researchflow.domain.run import RunSnapshot, RunStatus
 
 
 class RunStore(Protocol):
@@ -14,6 +14,8 @@ class RunStore(Protocol):
     ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]: ...
 
     async def load(self, run_id: str) -> RunSnapshot: ...
+
+    async def list_by_status(self, statuses: frozenset[RunStatus]) -> tuple[RunSnapshot, ...]: ...
 
     async def commit(
         self,

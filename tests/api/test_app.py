@@ -1,8 +1,13 @@
+import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from researchflow.adapters.persistence import SQLiteRunStore
 from researchflow.bootstrap import build_application
+from researchflow.domain.event import EventDraft, RunEventKind
+from researchflow.domain.plan import PlanDefinition, TaskSpec, TaskStatus
+from researchflow.domain.run import RunSnapshot, RunStatus
 from researchflow.settings import Settings
 
 
@@ -94,3 +99,97 @@ def test_run_api_persists_across_application_rebuild(tmp_path: Path) -> None:
 
     assert fetched.status_code == 200
     assert fetched.json() == started.json()
+
+
+def test_application_startup_recovers_interrupted_run_and_resume_continues(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "researchflow.db"
+    url = f"sqlite+aiosqlite:///{database.as_posix()}"
+    snapshot = RunSnapshot(
+        run_id="interrupted-run",
+        goal="Resume interrupted research",
+        status=RunStatus.RUNNING,
+        plan=PlanDefinition(
+            plan_id="recovery-plan",
+            tasks=(
+                TaskSpec(task_id="completed", title="Completed", capability="librarian"),
+                TaskSpec(
+                    task_id="interrupted",
+                    title="Interrupted",
+                    capability="coder",
+                    dependencies=("completed",),
+                    max_attempts=2,
+                ),
+            ),
+        ),
+        task_statuses={
+            "completed": TaskStatus.SUCCEEDED,
+            "interrupted": TaskStatus.RUNNING,
+        },
+        task_outputs={"completed": {"summary": "preserved"}},
+        task_attempts={"completed": 1, "interrupted": 1},
+        task_execution_ids={"interrupted": "old-execution"},
+    )
+
+    async def seed_interrupted_run() -> None:
+        store = SQLiteRunStore(url)
+        await store.create(
+            snapshot,
+            (
+                EventDraft(
+                    kind=RunEventKind.TASK_SUCCEEDED,
+                    run_id=snapshot.run_id,
+                    task_id="completed",
+                    execution_id="completed-execution",
+                ),
+                EventDraft(
+                    kind=RunEventKind.TASK_STARTED,
+                    run_id=snapshot.run_id,
+                    task_id="interrupted",
+                    execution_id="old-execution",
+                ),
+            ),
+        )
+        await store.close()
+
+    asyncio.run(seed_interrupted_run())
+
+    settings = Settings(environment="test", database_url=url)
+    with TestClient(build_application(settings)) as client:
+        recovered = client.get(f"/runs/{snapshot.run_id}")
+        assert recovered.status_code == 200
+        assert recovered.json()["status"] == "paused"
+        assert recovered.json()["task_statuses"] == {
+            "completed": "succeeded",
+            "interrupted": "ready",
+        }
+
+    with TestClient(build_application(settings)) as client:
+        recovered_again = client.get(f"/runs/{snapshot.run_id}")
+        assert recovered_again.json() == recovered.json()
+        recovery_events = client.get(f"/runs/{snapshot.run_id}/events").json()
+        assert [event["kind"] for event in recovery_events].count("run.recovered") == 1
+
+        resumed = client.post(f"/runs/{snapshot.run_id}/resume")
+        assert resumed.status_code == 200
+        assert resumed.json()["status"] == "succeeded"
+        assert resumed.json()["task_outputs"]["completed"] == {"summary": "preserved"}
+        assert resumed.json()["task_attempts"] == {"completed": 1, "interrupted": 2}
+
+        events = client.get(f"/runs/{snapshot.run_id}/events").json()
+        assert [event["kind"] for event in events].count("run.recovered") == 1
+        completed_starts = [
+            event
+            for event in events
+            if event["kind"] == "task.started" and event["task_id"] == "completed"
+        ]
+        assert completed_starts == []
+        interrupted_starts = [
+            event
+            for event in events
+            if event["kind"] == "task.started" and event["task_id"] == "interrupted"
+        ]
+        assert len(interrupted_starts) == 2
+        assert interrupted_starts[0]["execution_id"] == "old-execution"
+        assert interrupted_starts[-1]["execution_id"] != "old-execution"

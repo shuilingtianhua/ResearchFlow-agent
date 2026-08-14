@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -52,6 +53,29 @@ def test_sqlite_store_persists_snapshot_and_events_across_instances(tmp_path: Pa
         assert [event.kind for event in events] == ["run.created", "run.started"]
         assert events[-1].payload == {"source": "api"}
         assert [event.sequence for event in await reopened.list_events("run-1", 1)] == [2]
+        await reopened.close()
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_store_lists_matching_snapshots_after_reopen(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        url = database_url(tmp_path / "researchflow.db")
+        first = SQLiteRunStore(url)
+        running = replace(populated_snapshot(), version=0)
+        completed = replace(
+            running,
+            run_id="completed-run",
+            status=RunStatus.SUCCEEDED,
+        )
+        await first.create(running)
+        await first.create(completed)
+        await first.close()
+
+        reopened = SQLiteRunStore(url)
+        matches = await reopened.list_by_status(frozenset({RunStatus.RUNNING}))
+
+        assert matches == (running,)
         await reopened.close()
 
     asyncio.run(scenario())
@@ -172,5 +196,28 @@ def test_sqlite_store_reports_a_corrupt_database(tmp_path: Path) -> None:
         with pytest.raises(DependencyUnavailable, match="SQLite"):
             await store.load("run-1")
         await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_store_reports_a_corrupt_snapshot_during_status_listing(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "researchflow.db"
+        store = SQLiteRunStore(database_url(database))
+        await store.create(RunSnapshot(run_id="run-1", goal="Reproduce a paper"))
+        await store.close()
+
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE runs SET snapshot_json = ? WHERE run_id = ?",
+                ("not-json", "run-1"),
+            )
+
+        reopened = SQLiteRunStore(database_url(database))
+        with pytest.raises(DependencyUnavailable, match="stored run snapshot is invalid"):
+            await reopened.list_by_status(frozenset({RunStatus.RUNNING}))
+        await reopened.close()
 
     asyncio.run(scenario())

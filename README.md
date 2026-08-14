@@ -2,15 +2,17 @@
 
 ResearchFlow Agent 是一个基于 Sea-mult-agent 业务基线、使用 Python 重构的多智能体科研执行系统。它面向论文理解、代码仓库分析、受控实验、Scientific AutoResearch 与证据化报告生成。
 
-当前已经完成 M1 可运行执行闭环和 M2.1 SQLite 持久化：提交研究目标后，系统会生成固定任务图，通过 Fake Capability 执行，并把完整状态、输出和事件原子写入 SQLite。服务重启后可以重新查询已有 Run；未完成任务的自动恢复、真实模型和 Docker Sandbox 将在后续里程碑接入。
+当前已经完成 M1 可运行执行闭环、M2.1 SQLite 持久化和 M2.2 进程重启安全恢复：提交研究目标后，系统会生成固定任务图，通过 Fake Capability 执行，并把完整状态、输出和事件原子写入 SQLite。服务重启时会把中断的执行恢复为可安全 Resume 的暂停状态；后台 Worker、真实模型和 Docker Sandbox 将在后续里程碑接入。
 
 ## 文档
 
 - [产品需求文档](docs/PRD.md)
 - [Python 架构设计](docs/ARCHITECTURE.md)
 - [开发记录规范与索引](docs/development/README.md)
+- [当前项目交接与下一步](docs/handoffs/README.md)
 - [M1 执行闭环实施记录](docs/development/2026-08-14_m1_execution_loop.md)
 - [M2.1 SQLite 持久化实施记录](docs/development/2026-08-14_m2_sqlite_persistence.md)
+- [M2.2 进程重启安全恢复实施记录](docs/development/2026-08-14_m2_2_process_recovery.md)
 
 ## 本地启动
 
