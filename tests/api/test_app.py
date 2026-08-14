@@ -1,11 +1,18 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from researchflow.bootstrap import build_application
 from researchflow.settings import Settings
 
 
-def test_health_endpoint() -> None:
-    client = TestClient(build_application(Settings(environment="test")))
+def build_test_client(tmp_path: Path) -> TestClient:
+    database_url = f"sqlite+aiosqlite:///{(tmp_path / 'researchflow.db').as_posix()}"
+    return TestClient(build_application(Settings(environment="test", database_url=database_url)))
+
+
+def test_health_endpoint(tmp_path: Path) -> None:
+    client = build_test_client(tmp_path)
 
     response = client.get("/health")
 
@@ -17,8 +24,8 @@ def test_health_endpoint() -> None:
     }
 
 
-def test_run_api_executes_and_exposes_events() -> None:
-    client = TestClient(build_application(Settings(environment="test")))
+def test_run_api_executes_and_exposes_events(tmp_path: Path) -> None:
+    client = build_test_client(tmp_path)
 
     started = client.post("/runs", json={"goal": "Reproduce a paper"})
 
@@ -47,8 +54,8 @@ def test_run_api_executes_and_exposes_events() -> None:
     assert [event["kind"] for event in filtered.json()] == ["run.succeeded"]
 
 
-def test_run_api_maps_domain_errors() -> None:
-    client = TestClient(build_application(Settings(environment="test")))
+def test_run_api_maps_domain_errors(tmp_path: Path) -> None:
+    client = build_test_client(tmp_path)
 
     missing = client.get("/runs/not-found")
     assert missing.status_code == 404
@@ -63,8 +70,8 @@ def test_run_api_maps_domain_errors() -> None:
     assert invalid_pause.json()["error"] == "ContractViolation"
 
 
-def test_run_api_rejects_duplicate_run_id() -> None:
-    client = TestClient(build_application(Settings(environment="test")))
+def test_run_api_rejects_duplicate_run_id(tmp_path: Path) -> None:
+    client = build_test_client(tmp_path)
     request = {"run_id": "known-run", "goal": "Reproduce a paper"}
 
     assert client.post("/runs", json=request).status_code == 201
@@ -72,3 +79,18 @@ def test_run_api_rejects_duplicate_run_id() -> None:
 
     assert duplicate.status_code == 409
     assert duplicate.json()["error"] == "ConflictError"
+
+
+def test_run_api_persists_across_application_rebuild(tmp_path: Path) -> None:
+    first = build_test_client(tmp_path)
+    started = first.post(
+        "/runs",
+        json={"run_id": "persistent-run", "goal": "Reproduce a paper"},
+    )
+    assert started.status_code == 201
+
+    rebuilt = build_test_client(tmp_path)
+    fetched = rebuilt.get("/runs/persistent-run")
+
+    assert fetched.status_code == 200
+    assert fetched.json() == started.json()
