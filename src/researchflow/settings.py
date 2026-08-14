@@ -16,7 +16,7 @@ class Settings:
     port: int = 8000
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         defaults = cls()
         return cls(
             app_name=os.getenv("RESEARCHFLOW_APP_NAME", defaults.app_name),
