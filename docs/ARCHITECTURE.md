@@ -67,6 +67,7 @@ flowchart LR
 ```python
 class ResearchRuntime(Protocol):
     async def recover_interrupted_runs(self) -> int: ...
+    async def close(self) -> None: ...
     async def run_worker(self) -> None: ...
     async def submit(self, command: RunCommand) -> CommandResult: ...
     async def dispatch(self, command: RunCommand) -> CommandResult: ...
@@ -127,7 +128,7 @@ load(version=N)
 
 - 使用 AnyIO TaskGroup/CancelScope 进行结构化并发；禁止裸线程修改共享 Agent 状态。
 - 每个任务有独立超时、执行 ID 和单调租约 epoch；当前单进程 Worker 不声明远程心跳续租能力。
-- Worker 可以并发处理不同 Run；同一 Run 内无依赖冲突 Task 的并行调度仍待实现。
+- Worker 可以并发处理不同 Run；同一 Run 内无依赖冲突 Task 由 `RunBudget.max_concurrency` 限流并行执行。
 - 并发度、模型 token、墙钟时间和试验次数都由 `RunBudget` 控制。
 - API 断开不取消 Run；显式取消命令或策略才会终止执行。
 - 阻塞的 Git、Docker 和文件操作放入受控线程池，不污染事件循环。
@@ -172,7 +173,7 @@ ResearchFlow-Agent/
 
 ## 10. 实施顺序
 
-1. **运行闭环**：提交目标、生成固定计划、后台执行 Fake Capability、持久化状态、重启恢复和 SSE；当前已完成，Run 内并行调度仍待实现。
+1. **运行闭环**：提交目标、生成固定计划、后台并行执行 Fake Capability、持久化状态、重启恢复和 SSE；当前已完成。
 2. **真实执行**：Docker Sandbox、Git 仓库、产物存储、租约与恢复。
 3. **科研能力**：Librarian、Coder、Data 与证据化报告。
 4. **配置型 AutoResearch**：有限搜索空间、TrialLedger、Search/Holdout。

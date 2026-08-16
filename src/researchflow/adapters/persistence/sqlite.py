@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import TypeVar
 
+from anyio import CancelScope
 from pydantic import TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError
 from sqlalchemy import (
@@ -76,6 +77,14 @@ class SQLiteRunStore:
     async def create(
         self, snapshot: RunSnapshot, events: tuple[EventDraft, ...] = ()
     ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
+        result: tuple[RunSnapshot, tuple[RunEvent, ...]]
+        with CancelScope(shield=True):
+            result = await self._create(snapshot, events)
+        return result
+
+    async def _create(
+        self, snapshot: RunSnapshot, events: tuple[EventDraft, ...]
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
         if snapshot.version != 0:
             raise ContractViolation("a new run must start at version 0")
         _validate_event_run_ids(snapshot.run_id, events)
@@ -99,6 +108,12 @@ class SQLiteRunStore:
         return snapshot, stored_events
 
     async def load(self, run_id: str) -> RunSnapshot:
+        result: RunSnapshot
+        with CancelScope(shield=True):
+            result = await self._load(run_id)
+        return result
+
+    async def _load(self, run_id: str) -> RunSnapshot:
         await self._ensure_initialized()
         try:
             async with self._engine.connect() as connection:
@@ -112,6 +127,12 @@ class SQLiteRunStore:
         return _deserialize_snapshot(snapshot_json)
 
     async def list_by_status(self, statuses: frozenset[RunStatus]) -> tuple[RunSnapshot, ...]:
+        result: tuple[RunSnapshot, ...]
+        with CancelScope(shield=True):
+            result = await self._list_by_status(statuses)
+        return result
+
+    async def _list_by_status(self, statuses: frozenset[RunStatus]) -> tuple[RunSnapshot, ...]:
         await self._ensure_initialized()
         try:
             async with self._engine.connect() as connection:
@@ -124,6 +145,18 @@ class SQLiteRunStore:
         return tuple(snapshot for snapshot in snapshots if snapshot.status in statuses)
 
     async def commit(
+        self,
+        snapshot: RunSnapshot,
+        events: tuple[EventDraft, ...],
+        *,
+        expected_version: int,
+    ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:
+        result: tuple[RunSnapshot, tuple[RunEvent, ...]]
+        with CancelScope(shield=True):
+            result = await self._commit(snapshot, events, expected_version=expected_version)
+        return result
+
+    async def _commit(
         self,
         snapshot: RunSnapshot,
         events: tuple[EventDraft, ...],
@@ -154,6 +187,12 @@ class SQLiteRunStore:
         return snapshot, stored_events
 
     async def list_events(self, run_id: str, after_sequence: int = 0) -> tuple[RunEvent, ...]:
+        result: tuple[RunEvent, ...]
+        with CancelScope(shield=True):
+            result = await self._list_events(run_id, after_sequence)
+        return result
+
+    async def _list_events(self, run_id: str, after_sequence: int) -> tuple[RunEvent, ...]:
         await self._ensure_initialized()
         try:
             async with self._engine.connect() as connection:
@@ -175,7 +214,8 @@ class SQLiteRunStore:
         return tuple(_deserialize_event(value) for value in rows.scalars())
 
     async def close(self) -> None:
-        await self._engine.dispose()
+        with CancelScope(shield=True):
+            await self._engine.dispose()
 
     async def _ensure_initialized(self) -> None:
         if self._initialized:

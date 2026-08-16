@@ -71,6 +71,15 @@ class DelayedCapability(FakeCapability):
         return await super().invoke(request)
 
 
+class CloseTrackingStore(InMemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def test_run_submission_does_not_wait_for_capability_completion() -> None:
     runtime = RuntimeService(
         store=InMemoryRunStore(),
@@ -191,6 +200,20 @@ def test_health_endpoint(tmp_path: Path) -> None:
         "service": "ResearchFlow Agent",
         "environment": "test",
     }
+
+
+def test_application_lifespan_closes_runtime_store() -> None:
+    store = CloseTrackingStore()
+    runtime = RuntimeService(
+        store=store,
+        planner=FixedResearchPlanner(),
+        capabilities=CapabilityRegistry(),
+    )
+
+    with TestClient(create_app(runtime, Settings(environment="test"))) as client:
+        assert client.get("/health").status_code == 200
+
+    assert store.closed
 
 
 def test_run_api_executes_and_exposes_events(tmp_path: Path) -> None:

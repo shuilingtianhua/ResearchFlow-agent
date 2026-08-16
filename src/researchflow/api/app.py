@@ -21,11 +21,14 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        await runtime.recover_interrupted_runs()
-        async with create_task_group() as task_group:
-            task_group.start_soon(runtime.run_worker)
-            yield
-            task_group.cancel_scope.cancel()
+        try:
+            await runtime.recover_interrupted_runs()
+            async with create_task_group() as task_group:
+                task_group.start_soon(runtime.run_worker)
+                yield
+                task_group.cancel_scope.cancel()
+        finally:
+            await runtime.close()
 
     app = FastAPI(title=resolved.app_name, version="0.0.0", lifespan=lifespan)
     app.state.runtime = runtime

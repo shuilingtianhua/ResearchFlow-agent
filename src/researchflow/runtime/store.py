@@ -9,6 +9,8 @@ from researchflow.domain.run import RunSnapshot, RunStatus
 
 
 class RunStore(Protocol):
+    async def close(self) -> None: ...
+
     async def create(
         self, snapshot: RunSnapshot, events: tuple[EventDraft, ...] = ()
     ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]: ...

@@ -16,6 +16,9 @@ class InMemoryRunStore:
         self._events: dict[str, list[RunEvent]] = {}
         self._lock = asyncio.Lock()
 
+    async def close(self) -> None:
+        return None
+
     async def create(
         self, snapshot: RunSnapshot, events: tuple[EventDraft, ...] = ()
     ) -> tuple[RunSnapshot, tuple[RunEvent, ...]]:

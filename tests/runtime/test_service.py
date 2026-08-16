@@ -1,6 +1,8 @@
 import asyncio
 from dataclasses import replace
 
+import pytest
+
 from researchflow.adapters.capabilities import FakeCapability
 from researchflow.adapters.persistence import InMemoryRunStore
 from researchflow.capabilities import CapabilityRegistry, CapabilityRequest, CapabilityResult
@@ -61,6 +63,54 @@ class BlockingCapability:
             self.started.set()
             await self.release.wait()
         return CapabilityResult(outputs={"invocation": self.invocation_count})
+
+
+class ParallelPlanner:
+    def __init__(self, capability_name: str, task_count: int = 2) -> None:
+        self._capability_name = capability_name
+        self._task_count = task_count
+
+    async def build(self, context: PlanningContext) -> PlanDefinition:
+        return PlanDefinition(
+            plan_id=f"{context.run_id}-parallel-plan",
+            tasks=tuple(
+                TaskSpec(
+                    task_id=f"parallel_{index}",
+                    title=f"Parallel task {index}",
+                    capability=self._capability_name,
+                )
+                for index in range(self._task_count)
+            ),
+        )
+
+
+class ParallelProbeCapability:
+    def __init__(self, name: str, expected_starts: int) -> None:
+        self._name = name
+        self._expected_starts = expected_starts
+        self.first_started = asyncio.Event()
+        self.all_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.invocations: list[CapabilityRequest] = []
+        self.active_count = 0
+        self.max_active_count = 0
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    async def invoke(self, request: CapabilityRequest) -> CapabilityResult:
+        self.invocations.append(request)
+        self.active_count += 1
+        self.max_active_count = max(self.max_active_count, self.active_count)
+        self.first_started.set()
+        if len(self.invocations) == self._expected_starts:
+            self.all_started.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.active_count -= 1
+        return CapabilityResult(outputs={"task_id": request.task_id})
 
 
 class PauseBeforeResultStore(InMemoryRunStore):
@@ -270,6 +320,228 @@ def test_runtime_executes_dependencies_in_order() -> None:
         assert [event.sequence for event in result.emitted_events] == list(
             range(1, len(result.emitted_events) + 1)
         )
+
+    asyncio.run(scenario())
+
+
+def test_runtime_executes_independent_tasks_up_to_run_concurrency_limit() -> None:
+    async def scenario() -> None:
+        capability = ParallelProbeCapability("parallel", expected_starts=2)
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=ParallelPlanner(capability.name),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+
+        running = asyncio.create_task(
+            runtime.dispatch(
+                StartRun(
+                    run_id="parallel-run",
+                    goal="Run independent research tasks",
+                    budget=RunBudget(max_concurrency=2),
+                )
+            )
+        )
+        await asyncio.wait_for(capability.all_started.wait(), timeout=0.2)
+
+        assert capability.max_active_count == 2
+        capability.release.set()
+        result = await running
+        assert result.snapshot.status == RunStatus.SUCCEEDED
+        assert set(result.snapshot.task_outputs) == {"parallel_0", "parallel_1"}
+
+    asyncio.run(scenario())
+
+
+def test_runtime_does_not_exceed_run_concurrency_limit() -> None:
+    async def scenario() -> None:
+        capability = ParallelProbeCapability("parallel", expected_starts=2)
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=ParallelPlanner(capability.name),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+
+        running = asyncio.create_task(
+            runtime.dispatch(
+                StartRun(
+                    run_id="serial-budget-run",
+                    goal="Limit independent research tasks",
+                    budget=RunBudget(max_concurrency=1),
+                )
+            )
+        )
+        await asyncio.wait_for(capability.first_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.05)
+
+        assert len(capability.invocations) == 1
+        assert capability.max_active_count == 1
+        capability.release.set()
+        result = await running
+        assert result.snapshot.status == RunStatus.SUCCEEDED
+        assert len(capability.invocations) == 2
+        assert capability.max_active_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_runtime_waits_for_all_parallel_dependencies_before_join_task() -> None:
+    class DiamondPlanner:
+        async def build(self, context: PlanningContext) -> PlanDefinition:
+            return PlanDefinition(
+                plan_id=f"{context.run_id}-diamond-plan",
+                tasks=(
+                    TaskSpec(task_id="left", title="Left", capability="parallel"),
+                    TaskSpec(task_id="right", title="Right", capability="parallel"),
+                    TaskSpec(
+                        task_id="join",
+                        title="Join",
+                        capability="join",
+                        dependencies=("left", "right"),
+                    ),
+                ),
+            )
+
+    async def scenario() -> None:
+        parallel = ParallelProbeCapability("parallel", expected_starts=2)
+        join = FakeCapability("join")
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=DiamondPlanner(),
+            capabilities=CapabilityRegistry((parallel, join)),
+        )
+        running = asyncio.create_task(
+            runtime.dispatch(
+                StartRun(
+                    run_id="diamond-run",
+                    goal="Join parallel research results",
+                    budget=RunBudget(max_concurrency=2),
+                )
+            )
+        )
+        await asyncio.wait_for(parallel.all_started.wait(), timeout=0.2)
+
+        assert join.invocations == []
+        parallel.release.set()
+        result = await running
+
+        assert result.snapshot.status == RunStatus.SUCCEEDED
+        assert join.invocations[0].inputs["dependency_outputs"] == {
+            "left": {"task_id": "left"},
+            "right": {"task_id": "right"},
+        }
+
+    asyncio.run(scenario())
+
+
+def test_parallel_failure_invalidates_other_in_flight_results() -> None:
+    class BranchedPlanner:
+        async def build(self, context: PlanningContext) -> PlanDefinition:
+            return PlanDefinition(
+                plan_id=f"{context.run_id}-parallel-failure-plan",
+                tasks=(
+                    TaskSpec(task_id="broken", title="Broken", capability="broken"),
+                    TaskSpec(task_id="survivor", title="Survivor", capability="survivor"),
+                ),
+            )
+
+    class FailAfterSiblingStarts:
+        name = "broken"
+
+        def __init__(self, sibling_started: asyncio.Event) -> None:
+            self._sibling_started = sibling_started
+
+        async def invoke(self, request: CapabilityRequest) -> CapabilityResult:
+            await self._sibling_started.wait()
+            raise ExecutionFailure("parallel branch failed")
+
+    async def scenario() -> None:
+        survivor = BlockingCapability("survivor")
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=BranchedPlanner(),
+            capabilities=CapabilityRegistry((FailAfterSiblingStarts(survivor.started), survivor)),
+        )
+        running = asyncio.create_task(
+            runtime.dispatch(
+                StartRun(
+                    run_id="parallel-failure-run",
+                    goal="Isolate a failed parallel branch",
+                    budget=RunBudget(max_concurrency=2),
+                )
+            )
+        )
+        await asyncio.wait_for(survivor.started.wait(), timeout=0.2)
+        for _ in range(20):
+            if (await runtime.get("parallel-failure-run")).status == RunStatus.FAILED:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("parallel failure did not terminate the run")
+
+        survivor.release.set()
+        result = await running
+
+        assert result.snapshot.task_statuses == {
+            "broken": TaskStatus.FAILED,
+            "survivor": TaskStatus.CANCELLED,
+        }
+        assert result.snapshot.task_outputs == {}
+        ignored = [
+            event
+            for event in result.emitted_events
+            if event.kind == RunEventKind.TASK_RESULT_IGNORED
+        ]
+        assert [event.task_id for event in ignored] == ["survivor"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_run_status", "expected_task_status"),
+    (
+        ("pause", RunStatus.PAUSED, TaskStatus.READY),
+        ("cancel", RunStatus.CANCELLED, TaskStatus.CANCELLED),
+    ),
+)
+def test_parallel_control_invalidates_all_in_flight_results(
+    action: str,
+    expected_run_status: RunStatus,
+    expected_task_status: TaskStatus,
+) -> None:
+    async def scenario() -> None:
+        capability = ParallelProbeCapability("parallel", expected_starts=2)
+        runtime = RuntimeService(
+            store=InMemoryRunStore(),
+            planner=ParallelPlanner(capability.name),
+            capabilities=CapabilityRegistry((capability,)),
+        )
+        running = asyncio.create_task(
+            runtime.dispatch(
+                StartRun(
+                    run_id=f"parallel-{action}-run",
+                    goal=f"{action.title()} parallel research tasks",
+                    budget=RunBudget(max_concurrency=2),
+                )
+            )
+        )
+        await asyncio.wait_for(capability.all_started.wait(), timeout=0.2)
+
+        command = (
+            PauseRun(run_id=f"parallel-{action}-run")
+            if action == "pause"
+            else CancelRun(run_id=f"parallel-{action}-run")
+        )
+        controlled = await runtime.dispatch(command)
+        capability.release.set()
+        stopped = await running
+
+        assert controlled.snapshot.status == expected_run_status
+        assert set(stopped.snapshot.task_statuses.values()) == {expected_task_status}
+        assert stopped.snapshot.task_outputs == {}
+        assert [event.kind for event in stopped.emitted_events].count(
+            RunEventKind.TASK_RESULT_IGNORED
+        ) == 2
 
     asyncio.run(scenario())
 
