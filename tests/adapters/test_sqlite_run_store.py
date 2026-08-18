@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from researchflow.adapters.persistence import SQLiteRunStore
+from researchflow.domain.artifact import ArtifactRef
 from researchflow.domain.errors import ConflictError, ContractViolation, DependencyUnavailable
 from researchflow.domain.event import EventDraft
 from researchflow.domain.plan import PlanDefinition, TaskSpec, TaskStatus
@@ -29,6 +30,17 @@ def populated_snapshot() -> RunSnapshot:
         plan=plan,
         task_statuses={"read": TaskStatus.SUCCEEDED},
         task_outputs={"read": {"summary": "source collected"}},
+        task_artifacts={
+            "read": (
+                ArtifactRef(
+                    artifact_id="source",
+                    kind="text/plain",
+                    uri="artifact://sha256/" + "a" * 64,
+                    sha256="a" * 64,
+                    producer_task_id="read",
+                ),
+            )
+        },
         task_attempts={"read": 1},
     )
 

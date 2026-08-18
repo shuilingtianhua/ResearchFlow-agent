@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
+from researchflow.domain.artifact import ArtifactRef
 from researchflow.domain.errors import ContractViolation
 from researchflow.domain.event import utc_now
 from researchflow.domain.plan import PlanDefinition, TaskStatus
@@ -47,6 +48,7 @@ class RunSnapshot:
     plan: PlanDefinition | None = None
     task_statuses: Mapping[str, TaskStatus] = field(default_factory=dict)
     task_outputs: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    task_artifacts: Mapping[str, tuple[ArtifactRef, ...]] = field(default_factory=dict)
     task_errors: Mapping[str, str] = field(default_factory=dict)
     task_attempts: Mapping[str, int] = field(default_factory=dict)
     task_execution_ids: Mapping[str, str] = field(default_factory=dict)

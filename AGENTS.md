@@ -29,7 +29,7 @@ ResearchFlow Agent 是基于 Sea-mult-agent 业务语义、使用 Python 重构�
 - HTTP 创建和 Resume 已使用后台 Worker；Task 以新 `execution_id` 和单调 `lease_epoch` 原子领取。
 - Planner 和 Capability 是确定性测试实现，尚未连接真实模型。
 - 历史 JSON 和 SSE 使用同一持久化事件流，支持按事件序号断点续读。
-- 同一 Run 内的独立 Task 按 `RunBudget.max_concurrency` 并行执行；跨节点心跳租约、Docker Sandbox、Git Workspace、PostgreSQL 和真实 Artifact Store 尚未接入。
+- 同一 Run 内的独立 Task 按 `RunBudget.max_concurrency` 并行执行；本地文件系统 Artifact Store 已接入组合根，跨节点心跳租约、Docker Sandbox、Git Workspace、PostgreSQL 和远程对象存储尚未接入。
 
 新增功能应按可运行的垂直切片推进，不要先批量创建没有行为的空目录或抽象层。
 

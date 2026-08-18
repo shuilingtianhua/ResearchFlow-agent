@@ -24,6 +24,7 @@ class RunEventKind(StrEnum):
     RUN_FAILED = "run.failed"
     TASK_READY = "task.ready"
     TASK_STARTED = "task.started"
+    ARTIFACT_STORED = "artifact.stored"
     TASK_SUCCEEDED = "task.succeeded"
     TASK_RETRYING = "task.retrying"
     TASK_FAILED = "task.failed"

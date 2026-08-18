@@ -7,6 +7,7 @@ from typing import Self
 
 from pydantic import BaseModel, Field
 
+from researchflow.domain.artifact import ArtifactRef
 from researchflow.domain.event import RunEvent, RunEventKind
 from researchflow.domain.run import RunSnapshot
 
@@ -21,6 +22,28 @@ class RunActionRequest(BaseModel):
     reason: str = Field(default="user_requested", min_length=1)
 
 
+class ArtifactResponse(BaseModel):
+    artifact_id: str
+    kind: str
+    uri: str
+    sha256: str
+    producer_task_id: str | None
+    schema_version: str
+    metadata: dict[str, object]
+
+    @classmethod
+    def from_ref(cls, artifact: ArtifactRef) -> Self:
+        return cls(
+            artifact_id=artifact.artifact_id,
+            kind=artifact.kind,
+            uri=artifact.uri,
+            sha256=artifact.sha256,
+            producer_task_id=artifact.producer_task_id,
+            schema_version=artifact.schema_version,
+            metadata=dict(artifact.metadata),
+        )
+
+
 class RunResponse(BaseModel):
     run_id: str
     goal: str
@@ -29,6 +52,7 @@ class RunResponse(BaseModel):
     plan_id: str | None
     task_statuses: dict[str, str]
     task_outputs: dict[str, dict[str, object]]
+    task_artifacts: dict[str, tuple[ArtifactRef, ...]]
     task_errors: dict[str, str]
     task_attempts: dict[str, int]
     created_at: datetime
@@ -47,6 +71,9 @@ class RunResponse(BaseModel):
             },
             task_outputs={
                 task_id: dict(outputs) for task_id, outputs in snapshot.task_outputs.items()
+            },
+            task_artifacts={
+                task_id: tuple(artifacts) for task_id, artifacts in snapshot.task_artifacts.items()
             },
             task_errors=dict(snapshot.task_errors),
             task_attempts=dict(snapshot.task_attempts),

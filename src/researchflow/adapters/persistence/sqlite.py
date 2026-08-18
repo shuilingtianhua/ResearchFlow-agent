@@ -70,7 +70,11 @@ class SQLiteRunStore:
         self._database_path = _database_path(url.database)
         # NullPool avoids sharing async driver connections across TestClient event loops.
         pool = StaticPool if self._database_path is None else NullPool
-        self._engine: AsyncEngine = create_async_engine(database_url, poolclass=pool)
+        self._engine: AsyncEngine = create_async_engine(
+            database_url,
+            poolclass=pool,
+            connect_args={"timeout": 30.0},
+        )
         self._initialized = False
         self._initialization_lock = asyncio.Lock()
 

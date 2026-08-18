@@ -24,4 +24,6 @@ Thumbs.db
 
 data/
 artifacts/
+!src/researchflow/adapters/artifacts/
+!src/researchflow/adapters/artifacts/*.py
 logs/

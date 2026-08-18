@@ -15,6 +15,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8000
     database_url: str = "sqlite+aiosqlite:///./data/researchflow.db"
+    artifact_root: str = "./artifacts"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -25,4 +26,5 @@ class Settings:
             host=os.getenv("RESEARCHFLOW_HOST", defaults.host),
             port=int(os.getenv("RESEARCHFLOW_PORT", str(defaults.port))),
             database_url=os.getenv("RESEARCHFLOW_DATABASE_URL", defaults.database_url),
+            artifact_root=os.getenv("RESEARCHFLOW_ARTIFACT_ROOT", defaults.artifact_root),
         )

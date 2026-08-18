@@ -2,6 +2,7 @@
 
 from fastapi import FastAPI
 
+from researchflow.adapters.artifacts import FilesystemArtifactStore
 from researchflow.adapters.capabilities import FakeCapability
 from researchflow.adapters.persistence import SQLiteRunStore
 from researchflow.api import create_app
@@ -23,6 +24,7 @@ def build_runtime(settings: Settings) -> ResearchRuntime:
         store=SQLiteRunStore(settings.database_url),
         planner=FixedResearchPlanner(),
         capabilities=capabilities,
+        artifact_store=FilesystemArtifactStore(settings.artifact_root),
     )
 
 

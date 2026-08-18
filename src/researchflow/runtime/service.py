@@ -9,8 +9,16 @@ from uuid import uuid4
 
 from anyio import create_task_group, fail_after, sleep
 
+from researchflow.artifacts import ArtifactStore
 from researchflow.capabilities import CapabilityRegistry, CapabilityRequest, CapabilityResult
-from researchflow.domain.errors import ConflictError, ContractViolation
+from researchflow.domain.artifact import ArtifactRef
+from researchflow.domain.errors import (
+    ConflictError,
+    ContractViolation,
+    DependencyUnavailable,
+    ExecutionFailure,
+    NotFoundError,
+)
 from researchflow.domain.event import EventDraft, RunEvent, RunEventKind, utc_now
 from researchflow.domain.plan import TaskSpec, TaskStatus
 from researchflow.domain.run import RunSnapshot, RunStatus
@@ -38,10 +46,12 @@ class RuntimeService:
         store: RunStore,
         planner: PlanningModule,
         capabilities: CapabilityRegistry,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._store = store
         self._planner = planner
         self._capabilities = capabilities
+        self._artifact_store = artifact_store
 
     async def close(self) -> None:
         await self._store.close()
@@ -92,6 +102,36 @@ class RuntimeService:
 
     async def get(self, run_id: str) -> RunSnapshot:
         return await self._store.load(run_id)
+
+    async def get_artifact(self, run_id: str, artifact_id: str) -> ArtifactRef:
+        snapshot = await self._store.load(run_id)
+        artifact = self._find_artifact(snapshot, artifact_id)
+        await self._ensure_artifact_available(artifact)
+        return artifact
+
+    async def open_artifact(
+        self, run_id: str, artifact_id: str
+    ) -> tuple[ArtifactRef, AsyncIterator[bytes]]:
+        artifact = await self.get_artifact(run_id, artifact_id)
+        if self._artifact_store is None:
+            raise DependencyUnavailable("artifact store is not configured")
+        return artifact, self._artifact_store.open(artifact)
+
+    @staticmethod
+    def _find_artifact(snapshot: RunSnapshot, artifact_id: str) -> ArtifactRef:
+        for artifacts in snapshot.task_artifacts.values():
+            for artifact in artifacts:
+                if artifact.artifact_id == artifact_id:
+                    return artifact
+        raise NotFoundError(f"artifact {artifact_id!r} was not found in run {snapshot.run_id!r}")
+
+    async def _ensure_artifact_available(self, artifact: ArtifactRef) -> None:
+        if self._artifact_store is None:
+            raise DependencyUnavailable("artifact store is not configured")
+        if not await self._artifact_store.verify(artifact):
+            raise DependencyUnavailable(
+                f"artifact {artifact.artifact_id!r} is missing or failed integrity verification"
+            )
 
     async def events(self, run_id: str, after_sequence: int = 0) -> AsyncIterator[RunEvent]:
         for event in await self._store.list_events(run_id, after_sequence):
@@ -362,10 +402,16 @@ class RuntimeService:
             if timeout_seconds <= 0:
                 raise TimeoutError(timeout_message)
             with fail_after(timeout_seconds):
+                dependency_artifacts = await self._validated_artifacts(
+                    self._dependency_artifacts(running, task)
+                )
                 result = await self._capabilities.invoke(
                     task.capability,
-                    self._capability_request(running, task, execution_id),
+                    self._capability_request(
+                        running, task, execution_id, artifacts=dependency_artifacts
+                    ),
                 )
+                await self._validated_artifacts(result.artifacts)
         except TimeoutError:
             await self._record_task_failure(
                 running.run_id,
@@ -433,7 +479,12 @@ class RuntimeService:
         )
 
     def _capability_request(
-        self, snapshot: RunSnapshot, task: TaskSpec, execution_id: str
+        self,
+        snapshot: RunSnapshot,
+        task: TaskSpec,
+        execution_id: str,
+        *,
+        artifacts: tuple[ArtifactRef, ...] = (),
     ) -> CapabilityRequest:
         inputs = dict(task.inputs)
         inputs["dependency_outputs"] = {
@@ -446,7 +497,31 @@ class RuntimeService:
             execution_id=execution_id,
             lease_epoch=snapshot.task_attempts[task.task_id],
             inputs=inputs,
+            artifacts=artifacts,
         )
+
+    def _dependency_artifacts(
+        self, snapshot: RunSnapshot, task: TaskSpec
+    ) -> tuple[ArtifactRef, ...]:
+        return tuple(
+            artifact
+            for dependency in task.dependencies
+            for artifact in snapshot.task_artifacts.get(dependency, ())
+        )
+
+    async def _validated_artifacts(
+        self, artifacts: tuple[ArtifactRef, ...]
+    ) -> tuple[ArtifactRef, ...]:
+        if not artifacts:
+            return artifacts
+        if self._artifact_store is None:
+            raise ExecutionFailure("artifact store is required to validate task artifacts")
+        for artifact in artifacts:
+            if not await self._artifact_store.verify(artifact):
+                raise ExecutionFailure(
+                    f"artifact {artifact.artifact_id!r} failed integrity verification"
+                )
+        return artifacts
 
     async def _record_task_success(
         self,
@@ -478,6 +553,8 @@ class RuntimeService:
         statuses[task.task_id] = TaskStatus.SUCCEEDED
         outputs = dict(snapshot.task_outputs)
         outputs[task.task_id] = dict(result.outputs)
+        artifacts = dict(snapshot.task_artifacts)
+        artifacts[task.task_id] = tuple(result.artifacts)
         errors = dict(snapshot.task_errors)
         errors.pop(task.task_id, None)
         execution_ids = dict(snapshot.task_execution_ids)
@@ -486,8 +563,25 @@ class RuntimeService:
             snapshot,
             task_statuses=statuses,
             task_outputs=outputs,
+            task_artifacts=artifacts,
             task_errors=errors,
             task_execution_ids=execution_ids,
+        )
+        artifact_events = tuple(
+            EventDraft(
+                kind=RunEventKind.ARTIFACT_STORED,
+                run_id=snapshot.run_id,
+                task_id=task.task_id,
+                execution_id=execution_id,
+                payload={
+                    "artifact_id": artifact.artifact_id,
+                    "kind": artifact.kind,
+                    "uri": artifact.uri,
+                    "sha256": artifact.sha256,
+                    "schema_version": artifact.schema_version,
+                },
+            )
+            for artifact in result.artifacts
         )
         event = EventDraft(
             kind=RunEventKind.TASK_SUCCEEDED,
@@ -496,7 +590,7 @@ class RuntimeService:
             execution_id=execution_id,
             payload={"output_keys": sorted(result.outputs)},
         )
-        await self._commit(snapshot, succeeded, (event,))
+        await self._commit(snapshot, succeeded, artifact_events + (event,))
 
     async def _record_task_failure(
         self,

@@ -23,6 +23,8 @@
 | 2026-08-14 | M2.2 进程重启安全恢复 | 已实现并验证 | [进程重启安全恢复实施记录](2026-08-14_m2_2_process_recovery.md) |
 | 2026-08-14 | M2.3 后台执行与 SSE | 已实现并验证 | [后台执行与 SSE 实施记录](2026-08-14_m2_3_background_worker_sse.md) |
 | 2026-08-14 | M2.4 Run 内并行 DAG 调度 | 已实现并验证 | [Run 内并行 DAG 调度实施记录](2026-08-14_m2_4_parallel_scheduler.md) |
+| 2026-08-16 | M3.1 内容寻址 Artifact Store 与 Runtime 产物闭环 | 已实现并验证 | [内容寻址 Artifact Store 与 Runtime 产物闭环实施记录](2026-08-16_m3_1_artifact_store_runtime.md) |
+| 2026-08-16 | M3.2 Artifact 查询与流式下载 | 已实现并验证 | [Artifact 查询与流式下载实施记录](2026-08-16_m3_2_artifact_http.md) |
 
 ## 使用方式
 

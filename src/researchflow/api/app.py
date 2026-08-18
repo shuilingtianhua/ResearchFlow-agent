@@ -10,8 +10,19 @@ from anyio import create_task_group
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from researchflow.api.schemas import EventResponse, RunActionRequest, RunResponse, StartRunRequest
-from researchflow.domain.errors import ConflictError, ContractViolation, NotFoundError
+from researchflow.api.schemas import (
+    ArtifactResponse,
+    EventResponse,
+    RunActionRequest,
+    RunResponse,
+    StartRunRequest,
+)
+from researchflow.domain.errors import (
+    ConflictError,
+    ContractViolation,
+    DependencyUnavailable,
+    NotFoundError,
+)
 from researchflow.runtime import CancelRun, PauseRun, ResearchRuntime, ResumeRun, StartRun
 from researchflow.settings import Settings
 
@@ -45,6 +56,10 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
     async def invalid_contract(_: Request, exc: ContractViolation) -> JSONResponse:
         return _error_response(422, exc)
 
+    @app.exception_handler(DependencyUnavailable)
+    async def unavailable(_: Request, exc: DependencyUnavailable) -> JSONResponse:
+        return _error_response(status.HTTP_503_SERVICE_UNAVAILABLE, exc)
+
     @app.get("/health", tags=["system"])
     async def health() -> dict[str, str]:
         return {
@@ -67,6 +82,18 @@ def create_app(runtime: ResearchRuntime, settings: Settings | None = None) -> Fa
     @app.get("/runs/{run_id}", response_model=RunResponse)
     async def get_run(run_id: str) -> RunResponse:
         return RunResponse.from_snapshot(await runtime.get(run_id))
+
+    @app.get(
+        "/runs/{run_id}/artifacts/{artifact_id}",
+        response_model=ArtifactResponse,
+    )
+    async def get_artifact(run_id: str, artifact_id: str) -> ArtifactResponse:
+        return ArtifactResponse.from_ref(await runtime.get_artifact(run_id, artifact_id))
+
+    @app.get("/runs/{run_id}/artifacts/{artifact_id}/content")
+    async def download_artifact(run_id: str, artifact_id: str) -> StreamingResponse:
+        artifact, chunks = await runtime.open_artifact(run_id, artifact_id)
+        return StreamingResponse(chunks, media_type=_artifact_media_type(artifact.kind))
 
     @app.get("/runs/{run_id}/events", response_model=list[EventResponse])
     async def get_events(run_id: str, after_sequence: int = 0) -> list[EventResponse]:
@@ -118,3 +145,9 @@ def _error_response(status_code: int, error: Exception) -> JSONResponse:
         status_code=status_code,
         content={"error": type(error).__name__, "detail": str(error)},
     )
+
+
+def _artifact_media_type(kind: str) -> str:
+    if "/" in kind and "\r" not in kind and "\n" not in kind:
+        return kind
+    return "application/octet-stream"
